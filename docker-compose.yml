@@ -1,0 +1,56 @@
+version: "3.9"
+
+services:
+  bot:
+    build: .
+    container_name: stoabot
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+      - ./credentials:/app/credentials:ro  # Google Vision JSON (opsional)
+    networks:
+      - stoabot-net
+
+  db:
+    image: postgres:16-alpine
+    container_name: stoabot-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: stoabot
+      POSTGRES_USER: stoabot
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-stoabot_secret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stoabot -d stoabot"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - stoabot-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: stoabot-redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - stoabot-net
+
+volumes:
+  postgres_data:
+
+networks:
+  stoabot-net:
+    driver: bridge

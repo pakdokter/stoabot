@@ -5,7 +5,6 @@ Menghasilkan rekening koran format bank profesional menggunakan ReportLab.
 import io
 from datetime import date
 from decimal import Decimal
-from __future__ import annotations
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT

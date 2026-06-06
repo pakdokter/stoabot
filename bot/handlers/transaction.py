@@ -386,3 +386,131 @@ def build_hapus_conv() -> ConversationHandler:
         fallbacks=[CommandHandler("batal", cmd_cancel), CallbackQueryHandler(cmd_cancel, pattern="^cancel$")],
         conversation_timeout=300,
     )
+
+
+# ── /belanja ──
+
+BELANJA_ITEM, BELANJA_KETERANGAN = 10, 11
+
+async def cmd_belanja(update, context):
+    from bot.handlers.auth import ensure_registered
+    if not await ensure_registered(update, context):
+        return ConversationHandler.END
+    context.user_data["belanja_items"] = []
+    await update.message.reply_text(
+        "🛒 *Catat Belanja*\n\n"
+        "Masukkan item satu per satu.\n"
+        "Format: `nama item harga`\n"
+        "Contoh: `ayam slice 45000`\n\n"
+        "Ketik *selesai* jika sudah.",
+        parse_mode="Markdown"
+    )
+    return BELANJA_ITEM
+
+async def belanja_input_item(update, context):
+    from bot.utils.formatters import fmt_rupiah, parse_amount
+    text = update.message.text.strip()
+
+    if text.lower() in ("selesai", "done", "ok", "finish"):
+        items = context.user_data.get("belanja_items", [])
+        if not items:
+            await update.message.reply_text("❌ Belum ada item. Masukkan minimal 1 item.")
+            return BELANJA_ITEM
+
+        total = sum(i["amount"] for i in items)
+        lines = ["📋 *Ringkasan Belanja:*"]
+        for i in items:
+            lines.append(f"  - {i['name']}: {fmt_rupiah(i['amount'])}")
+        lines.append(f"{'─'*20}")
+        lines.append(f"*Total: {fmt_rupiah(total)}*")
+        lines.append("\nKeterangan? (nama toko/keperluan)")
+
+        context.user_data["belanja_total"] = total
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return BELANJA_KETERANGAN
+
+    # Parse "nama item harga" — angka di akhir adalah harga
+    parts = text.rsplit(None, 1)
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "❌ Format: `nama item harga`\nContoh: `ayam slice 45000`",
+            parse_mode="Markdown"
+        )
+        return BELANJA_ITEM
+
+    name = parts[0].strip().title()
+    amount = parse_amount(parts[1])
+
+    if not amount or amount <= 0:
+        await update.message.reply_text(
+            "❌ Harga tidak valid.\nContoh: `ayam slice 45000`",
+            parse_mode="Markdown"
+        )
+        return BELANJA_ITEM
+
+    context.user_data["belanja_items"].append({"name": name, "amount": amount})
+    total_sejauh_ini = sum(i["amount"] for i in context.user_data["belanja_items"])
+
+    await update.message.reply_text(
+        f"✅ *{name}* — {fmt_rupiah(amount)}\n"
+        f"_Total sejauh ini: {fmt_rupiah(total_sejauh_ini)}_\n\n"
+        f"Lanjut item berikutnya atau ketik *selesai*.",
+        parse_mode="Markdown"
+    )
+    return BELANJA_ITEM
+
+async def belanja_keterangan(update, context):
+    from bot.utils.formatters import fmt_rupiah, fmt_date
+    from datetime import date
+    from bot.database import AsyncSessionLocal
+    from bot.models import Transaction
+    from bot.services.balance import get_running_balance
+    from bot.services.audit import log_create
+
+    desc_text = update.message.text.strip()
+    tg_user = update.effective_user
+    total = context.user_data["belanja_total"]
+    items = context.user_data["belanja_items"]
+
+    # Buat deskripsi lengkap dengan item
+    item_list = ", ".join(f"{i['name']} {fmt_rupiah(i['amount'])}" for i in items)
+    full_desc = f"{desc_text} ({item_list})" if desc_text else item_list
+
+    async with AsyncSessionLocal() as session:
+        tx = Transaction(
+            user_id=tg_user.id,
+            type="keluar",
+            amount=total,
+            description=full_desc[:200],
+            transaction_date=date.today(),
+        )
+        session.add(tx)
+        await session.flush()
+        await log_create(session, tg_user.id, tx)
+        await session.commit()
+        saldo = await get_running_balance(session)
+
+    await update.message.reply_text(
+        f"✅ *Tersimpan*\n\n"
+        f"Jenis: ➖ KELUAR\n"
+        f"Total: *{fmt_rupiah(total)}*\n"
+        f"Keterangan: {desc_text}\n"
+        f"Tanggal: {fmt_date(date.today())}\n\n"
+        f"💰 Saldo: *{fmt_rupiah(saldo)}*",
+        parse_mode="Markdown"
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+def build_belanja_conv():
+    from telegram.ext import ConversationHandler, CommandHandler, MessageHandler, filters
+    return ConversationHandler(
+        entry_points=[CommandHandler("belanja", cmd_belanja)],
+        states={
+            BELANJA_ITEM: [MessageHandler(filters.TEXT & ~filters.COMMAND, belanja_input_item)],
+            BELANJA_KETERANGAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, belanja_keterangan)],
+        },
+        fallbacks=[CommandHandler("batal", cmd_cancel)],
+        conversation_timeout=300,
+    )

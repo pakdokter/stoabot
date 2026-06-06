@@ -334,9 +334,67 @@ def _classify_line(line: str) -> str:
     return 'unknown'
 
 
+
+def _join_fragmented_lines(lines: list) -> list:
+    """
+    OCR.space demo key sering menghasilkan output per-baris terfragmentasi.
+    Contoh:
+      Total        (baris 1)
+      =            (baris 2)
+      45.000       (baris 3)
+    
+    Fix: sambungkan baris yang hanya berisi operator/angka dengan baris sebelumnya.
+    """
+    if not lines:
+        return lines
+    
+    result = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        
+        # Baris yang hanya berisi operator = atau angka → sambung ke baris sebelum
+        is_operator = line in ['=', ':', '-', '=', '+']
+        is_pure_number = bool(re.match(r'^[\d.,]+$', line)) and len(line) <= 10
+        is_short_unit = line.upper() in {'SLOP', 'PACK', 'PAK', 'PCS', 'BTL', 'KLG', 'PAKx', 'BTL'}
+        
+        if (is_operator or is_pure_number or is_short_unit) and result:
+            # Sambung ke baris sebelumnya
+            result[-1] = result[-1] + '  ' + line
+        else:
+            result.append(line)
+        i += 1
+    
+    # Pass kedua: sambung baris angka yang sendirian setelah keyword finansial
+    result2 = []
+    i = 0
+    while i < len(result):
+        line = result[i]
+        # Jika baris ini adalah keyword finansial tanpa angka
+        # dan baris berikutnya adalah angka → gabung
+        has_financial_kw = any(re.search(p, line.lower()) for p in [
+            r'\btotal\b', r'\btunai\b', r'\bbayar\b', r'\bkembali\b',
+            r'\bdiskon\b', r'\bsubtotal\b'
+        ])
+        numbers_in_line = bool(re.search(r'\d{3,}', line))
+        
+        if has_financial_kw and not numbers_in_line and i + 1 < len(result):
+            next_line = result[i + 1].strip()
+            next_is_number = bool(re.match(r'^[=\s]*[\d.,]+\s*$', next_line))
+            if next_is_number:
+                result2.append(line + '  ' + next_line)
+                i += 2
+                continue
+        
+        result2.append(line)
+        i += 1
+    
+    return result2
+
 def _parse_receipt_text(text: str) -> OcrResult:
     result = OcrResult(raw_text=text)
     lines = [l.strip() for l in text.splitlines() if l.strip()]
+    lines = _join_fragmented_lines(lines)
 
     # ── Merchant ──
     header_skip = ['telp','fax','no.','no:','kasir','area','jl.',
@@ -462,7 +520,7 @@ async def process_receipt(bot, file_id: str) -> OcrResult:
                 "https://api.ocr.space/parse/image",
                 data={"apikey": api_key, "language": "eng",
                       "isOverlayRequired": "false", "detectOrientation": "true",
-                      "scale": "true", "OCREngine": "2"},
+                      "scale": "true", "OCREngine": "1"},
                 files={"file": ("struk.jpg", image_bytes, "image/jpeg")},
             )
 

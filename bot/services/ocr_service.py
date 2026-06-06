@@ -42,12 +42,16 @@ TOTAL_KEYWORDS = [
     r'\btotal\b', r'\bgrand\s*total\b', r'\bjumlah\b',
     r'\btagihan\b', r'\bsubtotal\b', r'\bsub\s*total\b',
     r'\bnetto\b', r'\bnet\b',
+    # OCR noise variants
+    r'\brotal\b', r'\bt0tal\b', r'\bt\*tal\b', r'\btoial\b',
 ]
 PAYMENT_KEYWORDS = [
     r'\btunai\b', r'\bcash\b', r'\bbayar\b', r'\bdibayar\b',
     r'\btransfer\b', r'\bdebit\b', r'\bkredit\b', r'\bkartu\b',
     r'\bqris\b', r'\bova\b', r'\bgopay\b', r'\bshopee\b',
     r'\bdana\b', r'\blinkaja\b',
+    # OCR noise variants
+    r'\brunai\b', r'\btunal\b', r'\btumai\b', r'\bbayaf\b',
 ]
 CHANGE_KEYWORDS = [
     r'\bkembali\b', r'\bkembalian\b', r'\bchange\b', r'\bselisih\b',
@@ -97,9 +101,13 @@ def _matches_any(text: str, patterns: list) -> bool:
 
 
 def _extract_money(text: str) -> list:
-    """Ekstrak angka yang kemungkinan nominal uang (>= 100)."""
+    """Ekstrak angka yang kemungkinan nominal uang (>= 100).
+    Toleran terhadap OCR noise: trailing -, =, tanda baca extra.
+    """
+    # Bersihkan noise: trailing -, =, karakter non-digit di ujung
+    text_clean = re.sub(r'[-=]+$', '', text.strip())
     results = []
-    for m in re.finditer(r'\d{1,3}(?:[.,]\d{3})+|\d+', text):
+    for m in re.finditer(r'\d{1,3}(?:[.,]\d{3})+|\d+', text_clean):
         raw = m.group(0).replace('.', '').replace(',', '')
         if raw.isdigit():
             val = float(raw)
@@ -455,17 +463,16 @@ def _parse_receipt_text(text: str) -> OcrResult:
         result.grand_total = min(best)
         result.total = result.grand_total
 
-    # Validasi total != tunai/kembalian
-    if result.total and result.cash_paid and abs(result.total - result.cash_paid) < 1:
+    # Validasi: total tidak boleh == kembalian (change)
+    # Tapi total BOLEH == cash (bayar pas / uang pas)
+    if result.total and result.change and abs(result.total - result.change) < 1:
+        # Cari nilai total alternatif
         for val, pri in sorted(total_candidates, key=lambda x: x[1]):
-            if abs(val - result.cash_paid) > 1:
+            if abs(val - result.change) > 1:
                 result.total = val
                 break
         else:
             result.total = None
-
-    if result.total and result.change and abs(result.total - result.change) < 1:
-        result.total = None
 
     # ── Item extraction ──
     # Coba Format A dulu (multi-line), lalu Format B (single-line)
@@ -520,7 +527,8 @@ async def process_receipt(bot, file_id: str) -> OcrResult:
                 "https://api.ocr.space/parse/image",
                 data={"apikey": api_key, "language": "eng",
                       "isOverlayRequired": "false", "detectOrientation": "true",
-                      "scale": "true", "OCREngine": "1"},
+                      "scale": "true", "isTable": "true",
+                      "OCREngine": "2"},
                 files={"file": ("struk.jpg", image_bytes, "image/jpeg")},
             )
 

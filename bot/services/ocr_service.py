@@ -1,6 +1,5 @@
 """
 OCR Service menggunakan OCR.space API
-Lebih akurat dari Tesseract untuk struk Indonesia.
 """
 import re
 import httpx
@@ -21,11 +20,9 @@ class OcrResult:
 
 
 async def process_receipt(bot, file_id: str) -> OcrResult:
-    """Download foto dari Telegram, kirim ke OCR.space, parse hasilnya."""
     try:
         import os
         api_key = os.environ.get("OCR_SPACE_API_KEY", "helloworld")
-
         file = await bot.get_file(file_id)
         image_bytes = bytes(await file.download_as_bytearray())
 
@@ -48,10 +45,9 @@ async def process_receipt(bot, file_id: str) -> OcrResult:
             logger.error(f"OCR.space error: {data.get('ErrorMessage')}")
             return OcrResult(confidence=0.0)
 
-        raw_text = ""
         parsed_results = data.get("ParsedResults", [])
-        if parsed_results:
-            raw_text = parsed_results[0].get("ParsedText", "")
+        raw_text = parsed_results[0].get("ParsedText", "") if parsed_results else ""
+        logger.info(f"OCR raw: {repr(raw_text)}")
 
         if not raw_text:
             return OcrResult(confidence=0.0)
@@ -63,61 +59,106 @@ async def process_receipt(bot, file_id: str) -> OcrResult:
         return OcrResult(confidence=0.0)
 
 
+def _extract_amount(text: str) -> Optional[float]:
+    """
+    Ekstrak angka dari string — toleran terhadap format:
+    45.000, 45,000, 45.000=, Rp45.000, 45000
+    Skip jika > 9 digit (nomor telepon).
+    """
+    # Hapus karakter non-angka kecuali titik dan koma
+    cleaned = re.sub(r'[^\d.,]', '', text)
+    if not cleaned:
+        return None
+    # Hapus titik/koma sebagai pemisah ribuan
+    cleaned = cleaned.replace('.', '').replace(',', '')
+    if not cleaned.isdigit():
+        return None
+    if len(cleaned) > 9:
+        return None
+    amount = float(cleaned)
+    if 100 <= amount <= 99_999_999:
+        return amount
+    return None
+
+
 def _parse_receipt_text(text: str) -> OcrResult:
     result = OcrResult(raw_text=text)
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-    # ── Merchant: baris pertama yang bukan angka ──
-    for line in lines[:4]:
-        if not re.match(r'^[\d\s\-\+\(\)\.\/]+$', line) and len(line) > 2:
-            result.merchant = line.title()
-            break
+    # ── Merchant ──
+    skip_words = ['telp', 'fax', 'no.', 'no:', 'kasir', 'area', 'jl.', 'jln', 'pel.', 'pelanggan']
+    for line in lines[:6]:
+        if re.match(r'^[\d\s\-\+\(\)\.\/:=]+$', line):
+            continue
+        if len(line) < 3:
+            continue
+        if any(w in line.lower() for w in skip_words):
+            continue
+        result.merchant = line.title()
+        break
 
     # ── Tanggal ──
-    date_patterns = [
-        r'(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})',
-        r'(\d{4})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})',
-    ]
-    for pattern in date_patterns:
-        m = re.search(pattern, text)
-        if m:
-            try:
-                from dateutil import parser as dp
-                result.tx_date = dp.parse(m.group(0), dayfirst=True).date()
-                break
-            except Exception:
-                pass
-
-    # ── Total: cari kata kunci total/bayar/tagihan ──
-    # Khusus hindari nomor telepon (>=10 digit berturut-turut)
-    total_patterns = [
-        r'(?:total|grand\s*total|jumlah|tagihan|bayar|tunai|cash)\s*[:\-]?\s*(?:rp\.?\s*)?(\d[\d\.]+)',
-        r'(?:rp\.?\s*)(\d[\d\.]{4,})\s*$',
-    ]
-    for pattern in total_patterns:
-        for m in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE):
-            raw = m.group(1).replace('.', '').replace(',', '')
-            # Skip jika lebih dari 10 digit (kemungkinan nomor telepon)
-            if len(raw) > 10:
-                continue
-            try:
-                amount = float(raw)
-                if 100 <= amount <= 99_999_999:
-                    result.total = amount
-                    break
-            except ValueError:
-                pass
-        if result.total:
+    for m in re.finditer(r'(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})', text):
+        try:
+            from dateutil import parser as dp
+            result.tx_date = dp.parse(m.group(0), dayfirst=True).date()
             break
+        except Exception:
+            pass
 
-    # Hitung confidence
+    # ── Total ──
+    # Cari baris per baris, prioritas berdasarkan keyword
+    candidates = []  # (prioritas, amount)
+
+    for line in lines:
+        ll = line.lower()
+
+        # Skip baris kembali/change
+        if re.search(r'\b(kembali|kembalian|change)\b', ll):
+            continue
+
+        # Cari semua angka di baris (format bebas: 45.000, 45.000=, dll)
+        # Regex: angka dengan opsional titik/koma ribuan
+        raw_numbers = re.findall(r'[\d]{1,3}(?:[.,]\d{3})*|\d+', line)
+
+        if re.search(r'\b(total|jumlah|tagihan)\b', ll):
+            for raw in raw_numbers:
+                amt = _extract_amount(raw)
+                if amt:
+                    candidates.append((0, amt))
+
+        elif re.search(r'\b(tunai|cash|bayar)\b', ll):
+            for raw in raw_numbers:
+                amt = _extract_amount(raw)
+                if amt:
+                    candidates.append((1, amt))
+
+    # Ambil prioritas tertinggi, jika sama ambil yang terkecil
+    # (total < tunai, jadi ambil terkecil di prioritas sama)
+    if candidates:
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        result.total = candidates[0][1]
+
+    # Fallback: angka terbesar di struk yang bukan dari baris kembali
+    if not result.total:
+        all_amounts = []
+        for line in lines:
+            if re.search(r'\b(kembali|kembalian|change|telp|fax)\b', line.lower()):
+                continue
+            for raw in re.findall(r'[\d]{1,3}(?:[.,]\d{3})*|\d+', line):
+                amt = _extract_amount(raw)
+                if amt:
+                    all_amounts.append(amt)
+        if all_amounts:
+            # Ambil nilai terbesar yang lebih kecil dari nilai tunai
+            all_amounts.sort()
+            result.total = all_amounts[-1]
+
+    # ── Confidence ──
     score = 0.0
-    if result.merchant:
-        score += 0.3
-    if result.tx_date:
-        score += 0.3
-    if result.total:
-        score += 0.4
+    if result.merchant: score += 0.3
+    if result.tx_date: score += 0.3
+    if result.total: score += 0.4
     result.confidence = round(score, 2)
 
     return result

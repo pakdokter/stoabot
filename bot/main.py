@@ -10,6 +10,7 @@ from bot.config import settings
 from bot.database import init_db
 from bot.handlers.auth import cmd_adduser, cmd_users
 from bot.handlers.transaction import (
+    build_belanja_conv,
     cmd_saldo, cmd_riwayat, cmd_cari,
     build_transaction_conv, build_edit_conv, build_hapus_conv,
 )
@@ -78,6 +79,7 @@ def create_app() -> Application:
         .post_init(post_init)
         .build()
     )
+    app.add_handler(build_belanja_conv())
     app.add_handler(build_transaction_conv())
     app.add_handler(build_edit_conv())
     app.add_handler(build_hapus_conv())

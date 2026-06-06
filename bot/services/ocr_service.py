@@ -228,7 +228,9 @@ def _parse_items_format_a(lines: list) -> list:
                     'jln', 'pel.', 'pelanggan', 'tanggal', 'date', 'struk',
                     'terima', 'jangan', 'lupa', 'powered', 'copyright',
                     'nota', 'invoice', 'receipt', 'selong', 'lombok',
-                    'pertokoan', 'mall', 'ruko', 'rukan'}
+                    'pertokoan', 'mall', 'ruko', 'rukan',
+                    'wa', 'instagram', 'facebook', 'twitter', 'tgl',
+                    'user', 'sc', 'pel', 'instagram'}
 
     items = []
     i = 0
@@ -244,6 +246,14 @@ def _parse_items_format_a(lines: list) -> list:
             # Skip baris header/alamat
             words_in_line = set(re.findall(r'[a-zA-Z]+', line.lower()))
             if words_in_line & header_words:
+                i += 1
+                continue
+            # Skip pola nomor struk: SI01-2606-0728, SB-9926F03I4915
+            if re.match(r'^[A-Z]{2,4}[0-9-]+', line.strip()):
+                i += 1
+                continue
+            # Skip baris yang mengandung "X" sebagai operator (header info)
+            if re.search(r'sc\s*:', line.lower()) or re.search(r'no\s*:', line.lower()):
                 i += 1
                 continue
 
@@ -289,7 +299,9 @@ def _parse_items_format_b(lines: list) -> list:
     """
     header_words_b = {'jl', 'jln', 'jalan', 'gg', 'area', 'pertokoan',
                       'mall', 'ruko', 'komplek', 'selong', 'lombok',
-                      'mataram', 'telp', 'fax', 'kasir'}
+                      'mataram', 'telp', 'fax', 'kasir',
+                      'wa', 'instagram', 'facebook', 'tgl', 'user',
+                      'sc', 'pel', 'no', 'sub'}
     items = []
     for line in lines:
         if not _is_item_name_line(line):
@@ -297,8 +309,14 @@ def _parse_items_format_b(lines: list) -> list:
         words_in_line = set(re.findall(r'[a-zA-Z]+', line.lower()))
         if words_in_line & header_words_b:
             continue
+        # Skip nomor struk: SI01-2606-0728, SB-9926F03I4915
+        if re.match(r'^[A-Z]{2,4}[0-9-]', line.strip()):
+            continue
         money_vals = _extract_money(line)
         if len(money_vals) < 1:
+            continue
+        # Minimum satu nilai >= 1000 (bukan kode produk/volume)
+        if not any(v >= 1000 for v, _ in money_vals):
             continue
         item = _parse_item_line_format_b(line)
         if item and len(item.name) >= 2:

@@ -34,7 +34,7 @@ logger.add(
 # ──────────────────────────────────────────────
 
 async def cmd_start(update, context):
-    from bot.handlers.auth import ensure_registered
+    from bot.handlers.auth import ensure_registered, handle_verify_callback, handle_name_input as auth_name_input
     from bot.database import AsyncSessionLocal
     from bot.models import User
     if not await ensure_registered(update, context):
@@ -46,7 +46,7 @@ async def cmd_start(update, context):
     # Cek apakah user sudah punya nama di DB
     async with AsyncSessionLocal() as session:
         user = await session.get(User, user_id)
-        has_name = user and user.full_name and user.full_name != "no_username" and len(user.full_name) > 1
+        has_name = user and user.full_name and user.full_name not in ("no_username", "") and len(user.full_name) > 1
 
     if not has_name:
         context.user_data["waiting_name"] = True
@@ -78,34 +78,8 @@ async def cmd_start(update, context):
 
 
 async def handle_name_input(update, context):
-    """Handler untuk input nama user saat /start pertama kali."""
-    if not context.user_data.get("waiting_name"):
-        return
-    name = update.message.text.strip()
-    if len(name) < 2:
-        await update.message.reply_text("❌ Nama terlalu pendek. Ketik nama lengkap kamu:")
-        return
-    user_id = update.effective_user.id
-    from bot.database import AsyncSessionLocal
-    from bot.models import User
-    async with AsyncSessionLocal() as session:
-        user = await session.get(User, user_id)
-        if user:
-            user.full_name = name
-            await session.commit()
-    context.user_data.pop("waiting_name", None)
-    await update.message.reply_text(
-        f"✅ Nama disimpan: *{name}*\n\n"
-        f"Sekarang kamu bisa mulai mencatat keuangan.\n\n"
-        "*Perintah tersedia:*\n"
-        "/masuk — catat pemasukan\n"
-        "/keluar — catat pengeluaran\n"
-        "/saldo — cek saldo\n"
-        "/riwayat — riwayat transaksi\n"
-        "/laporan — laporan per periode\n\n"
-        "📸 Kirim *foto struk* untuk input otomatis!",
-        parse_mode="Markdown",
-    )
+    """Delegasi ke auth handler untuk input nama."""
+    await auth_name_input(update, context)
 
 
 async def cmd_help(update, context):
@@ -161,6 +135,7 @@ def create_app() -> Application:
     app.add_handler(build_ocr_conv())
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CallbackQueryHandler(handle_verify_callback, pattern="^verify:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_name_input), group=99)
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("saldo", cmd_saldo))

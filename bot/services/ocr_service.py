@@ -347,58 +347,89 @@ def _classify_line(line: str) -> str:
 
 def _join_fragmented_lines(lines: list) -> list:
     """
-    OCR.space demo key sering menghasilkan output per-baris terfragmentasi.
-    Contoh:
-      Total        (baris 1)
-      =            (baris 2)
-      45.000       (baris 3)
+    Sambungkan baris-baris terfragmentasi dari OCR.
     
-    Fix: sambungkan baris yang hanya berisi operator/angka dengan baris sebelumnya.
+    Pattern yang ditangani:
+    1. NAMA → QTY UNIT → HARGA TOTAL        (3 baris terpisah)
+    2. NAMA → QTY UNIT HARGA → TOTAL        (2+1 baris)
+    3. KEYWORD = → ANGKA                    (finansial terpotong)
+    4. Baris pure angka/operator sendirian  → sambung ke atas
     """
     if not lines:
         return lines
-    
+
+    import re as _re
+
+    def _has_money(line):
+        for m in _re.finditer(r'\d{1,3}(?:[.,]\d{3})+|\d{4,}', line):
+            raw = m.group(0).replace('.','').replace(',','')
+            if raw.isdigit() and float(raw) >= 1000:
+                return True
+        return False
+
+    def _has_unit(line):
+        units = {'slop','pack','pak','pakx','pcs','pc','btl','klg','kg',
+                 'gr','gram','ltr','box','dus','rim','lusin','sachet'}
+        words = _re.findall(r'[a-zA-Z]+', line.lower())
+        return any(w in units for w in words)
+
+    def _has_qty(line):
+        m = _re.match(r'^\s*(\d{1,3})\s', line)
+        if m and 1 <= int(m.group(1)) <= 999:
+            return True
+        return False
+
+    def _is_pure_number_line(line):
+        """Baris yang hanya berisi angka/harga."""
+        stripped = line.strip()
+        return bool(_re.match(r'^[\d.,\s\t]+$', stripped)) and _has_money(stripped)
+
+    def _is_operator_line(line):
+        return line.strip() in ['=', ':', '-', '+', '=']
+
+    # ── Pass 1: sambung baris qty+unit (tanpa harga) dengan baris harga berikutnya ──
     result = []
     i = 0
     while i < len(lines):
         line = lines[i].strip()
-        
-        # Baris yang hanya berisi operator = atau angka → sambung ke baris sebelum
-        is_operator = line in ['=', ':', '-', '=', '+']
-        is_pure_number = bool(re.match(r'^[\d.,]+$', line)) and len(line) <= 10
-        is_short_unit = line.upper() in {'SLOP', 'PACK', 'PAK', 'PCS', 'BTL', 'KLG', 'PAKx', 'BTL'}
-        
-        if (is_operator or is_pure_number or is_short_unit) and result:
-            # Sambung ke baris sebelumnya
-            result[-1] = result[-1] + '  ' + line
-        else:
-            result.append(line)
+
+        # Baris operator/pure-number → sambung ke atas
+        if (_is_operator_line(line) or _is_pure_number_line(line)) and result:
+            result[-1] = result[-1] + '\t' + line
+            i += 1
+            continue
+
+        # Baris qty+unit TANPA harga → cek baris berikutnya
+        if _has_qty(line) and _has_unit(line) and not _has_money(line):
+            if i + 1 < len(lines):
+                next_line = lines[i + 1].strip()
+                # Baris berikutnya adalah angka/harga → gabung
+                if _is_pure_number_line(next_line) or _has_money(next_line):
+                    result.append(line + '\t' + next_line)
+                    i += 2
+                    continue
+
+        result.append(line)
         i += 1
-    
-    # Pass kedua: sambung baris angka yang sendirian setelah keyword finansial
+
+    # ── Pass 2: sambung keyword finansial yang angkanya di baris berikutnya ──
     result2 = []
     i = 0
     while i < len(result):
         line = result[i]
-        # Jika baris ini adalah keyword finansial tanpa angka
-        # dan baris berikutnya adalah angka → gabung
-        has_financial_kw = any(re.search(p, line.lower()) for p in [
+        has_financial_kw = any(_re.search(p, line.lower()) for p in [
             r'\btotal\b', r'\btunai\b', r'\bbayar\b', r'\bkembali\b',
-            r'\bdiskon\b', r'\bsubtotal\b'
+            r'\bdiskon\b', r'\bsubtotal\b', r'\brotal\b', r'\brunai\b',
         ])
-        numbers_in_line = bool(re.search(r'\d{3,}', line))
-        
-        if has_financial_kw and not numbers_in_line and i + 1 < len(result):
+        if has_financial_kw and not _has_money(line) and i + 1 < len(result):
             next_line = result[i + 1].strip()
-            next_is_number = bool(re.match(r'^[=\s]*[\d.,]+\s*$', next_line))
-            if next_is_number:
-                result2.append(line + '  ' + next_line)
+            if _is_pure_number_line(next_line):
+                result2.append(line + '\t' + next_line)
                 i += 2
                 continue
-        
         result2.append(line)
         i += 1
-    
+
     return result2
 
 def _normalize_ocr(text: str) -> str:

@@ -1,6 +1,6 @@
 """
 Report handlers:
-  /laporan  — filter rentang tanggal
+  /laporan  — pilihan periode: hari ini, minggu ini, bulan ini, atau rentang tanggal
   /ringkas  — dashboard bulan ini
   /statement — PDF rekening koran
 """
@@ -8,9 +8,10 @@ import io
 from calendar import monthrange
 from datetime import date, timedelta
 
-from telegram import Update
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
-    ContextTypes, ConversationHandler, CommandHandler, MessageHandler, filters,
+    ContextTypes, ConversationHandler, CommandHandler,
+    MessageHandler, CallbackQueryHandler, filters,
 )
 from sqlalchemy import select, desc
 from loguru import logger
@@ -24,24 +25,24 @@ from bot.handlers.auth import ensure_registered
 
 # States
 (
+    LAPORAN_MENU,
     LAPORAN_FROM, LAPORAN_TO,
     STMT_BULAN, STMT_TAHUN,
-) = range(4)
+) = range(5)
 
 
-# ──────────────────────────────────────────────
-# /ringkas — dashboard bulan ini
-# ──────────────────────────────────────────────
+# ── /ringkas ──────────────────────────────────────────────────────────
 
 async def cmd_ringkas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_registered(update, context):
         return
 
+    user_id = update.effective_user.id
     today = date.today()
     first_day = date(today.year, today.month, 1)
 
     async with AsyncSessionLocal() as session:
-        summary = await get_summary(session, date_from=first_day, date_to=today)
+        summary = await get_summary(session, user_id=user_id, date_from=first_day, date_to=today)
 
     days_passed = (today - first_day).days + 1
     avg_keluar = summary["total_keluar"] / days_passed if days_passed > 0 else 0
@@ -58,21 +59,74 @@ async def cmd_ringkas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ──────────────────────────────────────────────
-# /laporan — filter tanggal
-# ──────────────────────────────────────────────
+# ── /laporan ──────────────────────────────────────────────────────────
 
 async def cmd_laporan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_registered(update, context):
         return ConversationHandler.END
-    await update.message.reply_text("📅 Tanggal mulai? (DD/MM/YYYY)\nContoh: 01/07/2026")
-    return LAPORAN_FROM
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📅 Hari ini", callback_data="laporan:hari"),
+            InlineKeyboardButton("📆 Minggu ini", callback_data="laporan:minggu"),
+        ],
+        [
+            InlineKeyboardButton("🗓 Bulan ini", callback_data="laporan:bulan"),
+            InlineKeyboardButton("✏️ Rentang tanggal", callback_data="laporan:custom"),
+        ],
+    ])
+
+    await update.message.reply_text(
+        "📊 *Laporan Transaksi*\n\nPilih periode:",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+    return LAPORAN_MENU
+
+
+async def laporan_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = update.effective_user.id
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    today = date.today()
+    choice = query.data.split(":")[1]
+
+    if choice == "hari":
+        date_from = today
+        date_to = today
+        return await _show_laporan(query, user_id, date_from, date_to)
+
+    elif choice == "minggu":
+        date_from = today - timedelta(days=today.weekday())  # Senin
+        date_to = today
+        return await _show_laporan(query, user_id, date_from, date_to)
+
+    elif choice == "bulan":
+        date_from = date(today.year, today.month, 1)
+        date_to = today
+        return await _show_laporan(query, user_id, date_from, date_to)
+
+    elif choice == "custom":
+        try:
+            await query.edit_message_text(
+                "📅 Masukkan tanggal mulai:\n_(Format: DD/MM/YYYY, contoh: 01/06/2026)_",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        return LAPORAN_FROM
+
+    return ConversationHandler.END
 
 
 async def laporan_from(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = parse_date(update.message.text)
     if not d:
-        await update.message.reply_text("❌ Format tidak valid. Contoh: 01/07/2026")
+        await update.message.reply_text("❌ Format tidak valid. Contoh: 01/06/2026")
         return LAPORAN_FROM
     context.user_data["laporan_from"] = d
     await update.message.reply_text("Tanggal akhir? (DD/MM/YYYY)")
@@ -85,20 +139,31 @@ async def laporan_to(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Format tidak valid.")
         return LAPORAN_TO
 
-    date_from = context.user_data["laporan_from"]
+    date_from = context.user_data.get("laporan_from")
     date_to = d
+
+    if not date_from:
+        await update.message.reply_text("❌ Sesi habis. Coba /laporan lagi.")
+        return ConversationHandler.END
 
     if date_to < date_from:
         await update.message.reply_text("❌ Tanggal akhir tidak boleh sebelum tanggal mulai.")
         return LAPORAN_TO
 
+    user_id = update.effective_user.id
+    return await _show_laporan(update, user_id, date_from, date_to, from_message=True)
+
+
+async def _show_laporan(update_or_query, user_id: int, date_from: date, date_to: date, from_message: bool = False):
+    """Tampilkan laporan untuk rentang tanggal tertentu."""
     async with AsyncSessionLocal() as session:
-        summary = await get_summary(session, date_from=date_from, date_to=date_to)
+        summary = await get_summary(session, user_id=user_id, date_from=date_from, date_to=date_to)
 
         result = await session.execute(
             select(Transaction)
             .where(
                 Transaction.is_deleted == False,
+                Transaction.user_id == user_id,
                 Transaction.transaction_date >= date_from,
                 Transaction.transaction_date <= date_to,
             )
@@ -107,12 +172,18 @@ async def laporan_to(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         txs = result.scalars().all()
 
+    # Label periode
+    if date_from == date_to:
+        periode = f"📅 {fmt_date(date_from)}"
+    else:
+        periode = f"📅 {fmt_date(date_from)} s/d {fmt_date(date_to)}"
+
     lines = [
-        f"📊 *Laporan {fmt_date(date_from)} s/d {fmt_date(date_to)}*\n",
-        f"Total Masuk:\n*{fmt_rupiah(summary['total_masuk'])}*\n",
-        f"Total Keluar:\n*{fmt_rupiah(summary['total_keluar'])}*\n",
-        f"Saldo Periode:\n*{fmt_rupiah(summary['saldo'])}*\n",
-        f"Jumlah Transaksi: {summary['jumlah']}\n",
+        f"📊 *Laporan Transaksi*\n{periode}\n",
+        f"Total Masuk: *{fmt_rupiah(summary['total_masuk'])}*",
+        f"Total Keluar: *{fmt_rupiah(summary['total_keluar'])}*",
+        f"Saldo Periode: *{fmt_rupiah(summary['saldo'])}*",
+        f"Jumlah Transaksi: *{summary['jumlah']}*",
         "─────────────────",
     ]
 
@@ -123,14 +194,24 @@ async def laporan_to(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not txs:
         lines.append("_(tidak ada transaksi dalam periode ini)_")
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-    context.user_data.clear()
+    msg = "\n".join(lines)
+
+    try:
+        if from_message:
+            await update_or_query.message.reply_text(msg, parse_mode="Markdown")
+        else:
+            await update_or_query.edit_message_text(msg, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"[LAPORAN] reply failed: {e}")
+        try:
+            await update_or_query.message.reply_text(msg, parse_mode="Markdown")
+        except Exception:
+            pass
+
     return ConversationHandler.END
 
 
-# ──────────────────────────────────────────────
-# /statement — PDF
-# ──────────────────────────────────────────────
+# ── /statement ────────────────────────────────────────────────────────
 
 async def cmd_statement(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_registered(update, context):
@@ -138,7 +219,7 @@ async def cmd_statement(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     today = date.today()
     await update.message.reply_text(
-        f"📄 *E-Statement PDF*\n\nBulan? (1-12, contoh: 7 untuk Juli)\n"
+        f"📄 *E-Statement PDF*\n\nBulan? (1-12, contoh: 6 untuk Juni)\n"
         f"Atau ketik `sekarang` untuk bulan ini ({today.month}/{today.year})",
         parse_mode="Markdown",
     )
@@ -183,6 +264,7 @@ async def stmt_tahun(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _generate_statement(update: Update, context: ContextTypes.DEFAULT_TYPE):
     month = context.user_data["stmt_month"]
     year = context.user_data["stmt_year"]
+    user_id = update.effective_user.id
     date_from = date(year, month, 1)
     last_day = monthrange(year, month)[1]
     date_to = date(year, month, last_day)
@@ -194,6 +276,7 @@ async def _generate_statement(update: Update, context: ContextTypes.DEFAULT_TYPE
             select(Transaction)
             .where(
                 Transaction.is_deleted == False,
+                Transaction.user_id == user_id,
                 Transaction.transaction_date >= date_from,
                 Transaction.transaction_date <= date_to,
             )
@@ -201,9 +284,10 @@ async def _generate_statement(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         txs = result.scalars().all()
 
-        # Saldo awal = semua transaksi sebelum periode ini
-        from bot.services.balance import get_summary
-        pre_summary = await get_summary(session, date_to=date_from - timedelta(days=1))
+        pre_summary = await get_summary(
+            session, user_id=user_id,
+            date_to=date_from - timedelta(days=1)
+        )
         saldo_awal = pre_summary["saldo"]
 
     try:
@@ -218,32 +302,40 @@ async def _generate_statement(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error(f"PDF generation failed: {e}")
         await update.message.reply_text("❌ Gagal membuat PDF. Coba lagi.")
 
+    _p = {k: context.user_data[k] for k in ("session_verified", "db_user") if k in context.user_data}
     context.user_data.clear()
+    context.user_data.update(_p)
     return ConversationHandler.END
 
 
-# ──────────────────────────────────────────────
-# Cancel
-# ──────────────────────────────────────────────
+# ── Cancel ────────────────────────────────────────────────────────────
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _p = {k: context.user_data[k] for k in ("session_verified", "db_user") if k in context.user_data}
     context.user_data.clear()
+    context.user_data.update(_p)
     await update.message.reply_text("❌ Dibatalkan.")
     return ConversationHandler.END
 
 
-# ──────────────────────────────────────────────
-# Builders
-# ──────────────────────────────────────────────
+# ── Builders ──────────────────────────────────────────────────────────
 
 def build_laporan_conv() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[CommandHandler("laporan", cmd_laporan)],
         states={
-            LAPORAN_FROM: [MessageHandler(filters.TEXT & ~filters.COMMAND, laporan_from)],
-            LAPORAN_TO: [MessageHandler(filters.TEXT & ~filters.COMMAND, laporan_to)],
+            LAPORAN_MENU: [
+                CallbackQueryHandler(laporan_menu_callback, pattern="^laporan:"),
+            ],
+            LAPORAN_FROM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, laporan_from),
+            ],
+            LAPORAN_TO: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, laporan_to),
+            ],
         },
         fallbacks=[CommandHandler("batal", cmd_cancel)],
+        allow_reentry=True,
         conversation_timeout=300,
     )
 
@@ -256,5 +348,6 @@ def build_statement_conv() -> ConversationHandler:
             STMT_TAHUN: [MessageHandler(filters.TEXT & ~filters.COMMAND, stmt_tahun)],
         },
         fallbacks=[CommandHandler("batal", cmd_cancel)],
+        allow_reentry=True,
         conversation_timeout=300,
     )

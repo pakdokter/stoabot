@@ -20,6 +20,7 @@ from loguru import logger
 from bot.database import AsyncSessionLocal
 from bot.models import Transaction, User
 from bot.services.balance import get_running_balance, get_summary
+from bot.services.sheets import append_transaction as sheets_append
 from bot.services.audit import log_create, log_update, log_delete
 from bot.utils.formatters import fmt_rupiah, fmt_date, parse_amount, parse_date
 from bot.handlers.auth import ensure_registered
@@ -133,7 +134,18 @@ async def handle_tanggal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await log_create(session, tg_user.id, tx)
         await session.commit()
 
-        saldo = await get_running_balance(session2, user_id=user_id)
+    async with AsyncSessionLocal() as session2:
+        saldo = await get_running_balance(session2, user_id=tg_user.id)
+
+    # Simpan ke Google Sheets
+    db_user = context.user_data.get("db_user")
+    user_name = db_user.full_name if db_user else str(tg_user.id)
+    await sheets_append(
+        user_id=tg_user.id, user_name=user_name,
+        tx_type=tx_type, amount=amount,
+        description=desc_text, tx_date=tx_date,
+        source="manual",
+    )
 
     emoji = "✅" if tx_type == "masuk" else "✅"
     await update.message.reply_text(

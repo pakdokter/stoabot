@@ -192,42 +192,52 @@ async def cmd_riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_registered(update, context):
         return
 
+    from datetime import date as _date, timedelta
+    from collections import defaultdict
+
     user_id = update.effective_user.id
-    page = int(context.args[0]) if context.args else 0
-    offset = page * PAGE_SIZE
+    today = _date.today()
+    date_from = today - timedelta(days=6)  # 7 hari terakhir
 
     async with AsyncSessionLocal() as session:
         result = await session.execute(
             select(Transaction)
-            .where(Transaction.is_deleted == False, Transaction.user_id == user_id)
+            .where(
+                Transaction.is_deleted == False,
+                Transaction.user_id == user_id,
+                Transaction.transaction_date >= date_from,
+                Transaction.transaction_date <= today,
+            )
             .order_by(desc(Transaction.transaction_date), desc(Transaction.created_at))
-            .offset(offset)
-            .limit(PAGE_SIZE + 1)
         )
         txs = result.scalars().all()
 
     if not txs:
-        await update.message.reply_text("Belum ada transaksi tercatat.")
+        await update.message.reply_text(
+            f"Belum ada transaksi dalam 7 hari terakhir\n"
+            f"({fmt_date(date_from)} — {fmt_date(today)})."
+        )
         return
 
-    has_more = len(txs) > PAGE_SIZE
-    txs = txs[:PAGE_SIZE]
-
-    # Kelompokkan per tanggal
-    from collections import defaultdict
     by_date = defaultdict(list)
     for tx in txs:
         by_date[tx.transaction_date].append(tx)
 
-    lines = [f"📋 *Riwayat Transaksi* (hal. {page + 1})\n"]
+    total_masuk = sum(tx.amount for tx in txs if tx.type == "masuk")
+    total_keluar = sum(tx.amount for tx in txs if tx.type == "keluar")
+
+    lines = [
+        f"📋 *Riwayat 7 Hari Terakhir*",
+        f"_{fmt_date(date_from)} — {fmt_date(today)}_\n",
+        f"Masuk: *{fmt_rupiah(total_masuk)}* | Keluar: *{fmt_rupiah(total_keluar)}*",
+        "─────────────────",
+    ]
+
     for d in sorted(by_date.keys(), reverse=True):
         lines.append(f"\n*{fmt_date(d)}*")
         for tx in by_date[d]:
             sign = "+" if tx.type == "masuk" else "-"
             lines.append(f"  {sign} {fmt_rupiah(tx.amount)}\n   _{tx.description}_")
-
-    if has_more:
-        lines.append(f"\n/riwayat {page + 1} → halaman berikutnya")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 

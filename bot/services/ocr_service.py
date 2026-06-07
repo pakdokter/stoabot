@@ -68,6 +68,7 @@ SAVINGS_KEYWORDS = [
     r'\bharga\s+jual\b', r'\brga\s+jual\b',
     r'\bdpp\s*=\b', r'\bppn\s*=\b',
     r'\bpwp\b', r'\blp\s+\d\b',
+    r'\btotal\s+qty\b', r'\bjml\s+item\b',
 ]
 DISCOUNT_KEYWORDS = [
     r'\bdiskon\b', r'\bdiscount\b', r'\bdisc\b', r'\bkorting\b',
@@ -263,6 +264,10 @@ def _parse_item_line_format_b(line: str) -> Optional[ReceiptItem]:
         unit_price = line_total
 
     name = name_part.strip().rstrip('-').rstrip('.').strip()
+    # Hapus nomor urut di awal: "1. ", "2. ", "1) "
+    name = re.sub(r'^\d+[\.\)\-]\s*', '', name).strip()
+    # Hapus suffix "Rp" / "RP" di akhir nama
+    name = re.sub(r'\s+[Rr][Pp]\.?$', '', name).strip()
     if len(name) < 2:
         return None
 
@@ -557,13 +562,24 @@ def _parse_receipt_text(text: str) -> OcrResult:
             break
 
     # ── Tanggal ──
-    for m in re.finditer(r'(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})', text):
+    # Coba format ISO dulu: YYYY-MM-DD atau YYYY/MM/DD
+    iso_match = re.search(r'(20\d{2})[\-\/](\d{2})[\-\/](\d{2})', text)
+    if iso_match:
         try:
-            from dateutil import parser as dp
-            result.tx_date = dp.parse(m.group(0), dayfirst=True).date()
-            break
+            from datetime import date as _date
+            result.tx_date = _date(int(iso_match.group(1)), int(iso_match.group(2)), int(iso_match.group(3)))
         except Exception:
             pass
+
+    # Fallback: format DD/MM/YYYY
+    if not result.tx_date:
+        for m in re.finditer(r'(\d{1,2})[\/\.](\d{1,2})[\/\.](\d{4})', text):
+            try:
+                from dateutil import parser as dp
+                result.tx_date = dp.parse(m.group(0), dayfirst=True).date()
+                break
+            except Exception:
+                pass
 
     # ── Financial summary ──
     total_candidates = []

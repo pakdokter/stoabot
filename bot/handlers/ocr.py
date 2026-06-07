@@ -36,7 +36,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_registered(update, context):
         return ConversationHandler.END
     user_id = update.effective_user.id
+    # Preserve session_verified dan db_user saat clear
+    _preserved = {
+        k: context.user_data[k]
+        for k in ("session_verified", "db_user")
+        if k in context.user_data
+    }
     context.user_data.clear()
+    context.user_data.update(_preserved)
     _log(user_id, "IDLE", "photo_received")
     await update.message.reply_text("🔍 Memproses struk...")
     try:

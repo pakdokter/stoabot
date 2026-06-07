@@ -30,7 +30,10 @@ from bot.handlers.auth import ensure_registered
     TX_NOMINAL, TX_KETERANGAN, TX_TANGGAL,
     EDIT_PILIH, EDIT_FIELD, EDIT_NILAI,
     HAPUS_KONFIRMASI,
-) = range(7)
+    TX_SUMBER_LAINNYA,
+) = range(8)
+
+SUMBER_MASUK = ["Bank Biru", "Kasir", "Lainnya"]
 
 
 # ──────────────────────────────────────────────
@@ -70,6 +73,9 @@ def _tx_inline_keyboard(transactions: list[Transaction]) -> InlineKeyboardMarkup
 async def cmd_masuk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_registered(update, context):
         return ConversationHandler.END
+    _p = {k: context.user_data[k] for k in ("session_verified","db_user") if k in context.user_data}
+    context.user_data.clear()
+    context.user_data.update(_p)
     context.user_data["tx_type"] = "masuk"
     await update.message.reply_text("💰 *Catat Pemasukan*\n\nNominal?", parse_mode="Markdown")
     return TX_NOMINAL
@@ -89,6 +95,23 @@ async def handle_nominal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Nominal tidak valid. Contoh: 150000, 150rb, 1.5jt")
         return TX_NOMINAL
     context.user_data["tx_amount"] = amount
+
+    # Jika masuk → tampilkan pilihan sumber
+    if context.user_data.get("tx_type") == "masuk":
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏦 Bank Biru", callback_data="sumber:Bank Biru"),
+            InlineKeyboardButton("🏪 Kasir", callback_data="sumber:Kasir"),
+        ],[
+            InlineKeyboardButton("✏️ Lainnya", callback_data="sumber:Lainnya"),
+        ]])
+        await update.message.reply_text(
+            f"💰 *{fmt_rupiah(amount)}*\n\nSumber dana?",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+        return TX_KETERANGAN
+
+    # Keluar → langsung tanya keterangan
     await update.message.reply_text("Keterangan?")
     return TX_KETERANGAN
 
@@ -469,6 +492,109 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ConversationHandler builders
 # ──────────────────────────────────────────────
 
+
+async def handle_sumber_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler pilihan sumber dana untuk transaksi masuk."""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    sumber = query.data.split(":", 1)[1]
+
+    if sumber == "Lainnya":
+        try:
+            await query.edit_message_text(
+                "✏️ Ketik sumber dana:\n_(contoh: Penjualan Kue, Transfer Owner)_",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        return TX_SUMBER_LAINNYA
+
+    return await _simpan_masuk(query, context, user_id, sumber, from_query=True)
+
+
+async def handle_sumber_lainnya(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler input sumber lainnya secara manual."""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    if not text or len(text) < 2:
+        await update.message.reply_text("❌ Sumber tidak boleh kosong.")
+        return TX_SUMBER_LAINNYA
+    return await _simpan_masuk(update, context, user_id, text, from_query=False)
+
+
+async def _simpan_masuk(update_or_query, context, user_id, keterangan, from_query):
+    """Simpan transaksi masuk."""
+    from datetime import date as _date
+    amount = context.user_data.get("tx_amount", 0)
+    tx_date = _date.today()
+
+    try:
+        async with AsyncSessionLocal() as session:
+            tx = Transaction(
+                user_id=user_id, type="masuk", amount=amount,
+                description=keterangan, transaction_date=tx_date,
+            )
+            session.add(tx)
+            await session.flush()
+            await log_create(session, user_id, tx)
+            await session.commit()
+
+        async with AsyncSessionLocal() as session2:
+            saldo = await get_running_balance(session2, user_id=user_id)
+
+        db_user = context.user_data.get("db_user")
+        user_name = db_user.full_name if db_user else str(user_id)
+        from bot.services.sheets import append_transaction as sheets_append
+        await sheets_append(
+            user_id=user_id, user_name=user_name,
+            tx_type="masuk", amount=amount,
+            description=keterangan, tx_date=tx_date,
+            source="manual",
+        )
+
+        msg = (
+            f"✅ *Pemasukan berhasil dicatat*\n\n"
+            f"Jenis: ➕ MASUK\n"
+            f"Nominal: *{fmt_rupiah(amount)}*\n"
+            f"Sumber: {keterangan}\n"
+            f"Tanggal: {fmt_date(tx_date)}\n\n"
+            f"💰 Saldo saat ini:\n*{fmt_rupiah(saldo)}*"
+        )
+
+        try:
+            if from_query:
+                await update_or_query.edit_message_text(msg, parse_mode="Markdown")
+            else:
+                await update_or_query.message.reply_text(msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"[TX] reply: {e}")
+            try:
+                if from_query:
+                    await update_or_query.message.reply_text(msg, parse_mode="Markdown")
+            except Exception:
+                pass
+
+    except Exception as e:
+        logger.exception(f"[TX-ERROR] masuk uid={user_id}: {e}")
+        err = f"❌ Gagal.\n`{type(e).__name__}: {e}`"
+        try:
+            if from_query:
+                await update_or_query.edit_message_text(err, parse_mode="Markdown")
+            else:
+                await update_or_query.message.reply_text(err, parse_mode="Markdown")
+        except Exception:
+            pass
+
+    _p = {k: context.user_data[k] for k in ("session_verified","db_user") if k in context.user_data}
+    context.user_data.clear()
+    context.user_data.update(_p)
+    return ConversationHandler.END
+
 def build_transaction_conv() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[
@@ -477,10 +603,16 @@ def build_transaction_conv() -> ConversationHandler:
         ],
         states={
             TX_NOMINAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_nominal)],
-            TX_KETERANGAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_keterangan)],
-            TX_TANGGAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tanggal)],
+            TX_KETERANGAN: [
+                CallbackQueryHandler(handle_sumber_callback, pattern="^sumber:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_keterangan),
+            ],
+            TX_SUMBER_LAINNYA: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_sumber_lainnya),
+            ],
         },
         fallbacks=[CommandHandler("batal", cmd_cancel)],
+        allow_reentry=True,
         conversation_timeout=300,
     )
 

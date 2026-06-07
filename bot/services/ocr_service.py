@@ -477,7 +477,8 @@ def _join_fragmented_lines(lines: list) -> list:
         ])
         if has_financial_kw and not _has_money(line) and i + 1 < len(result):
             next_line = result[i + 1].strip()
-            if _is_pure_number_line(next_line):
+            # Gabung jika baris berikutnya adalah angka (termasuk "0")
+            if _is_pure_number_line(next_line) or re.match(r'^\d+$', next_line.strip()):
                 result2.append(line + '\t' + next_line)
                 i += 2
                 continue
@@ -498,10 +499,12 @@ def _normalize_ocr(text: str) -> str:
     # Bersihkan karakter aneh yang sering muncul di OCR thermal
     result = result.replace('@', '').replace("'i", '').replace("'", '')
     # Bersihkan ":" atau spasi di awal baris item (OCR noise Indomaret)
-    # ":TUNE MYK.GRG RF2L" → "TUNE MYK.GRG RF2L"
     lines_out = []
     for line in result.splitlines():
+        # Hapus ":" di awal baris yang diikuti huruf kapital
         cleaned = re.sub(r'^[:\s]+(?=[A-Z])', '', line)
+        # Ganti tab ganda/multiple dengan satu tab
+        cleaned = re.sub(r'\t+', '\t', cleaned)
         lines_out.append(cleaned)
     return '\n'.join(lines_out)
 

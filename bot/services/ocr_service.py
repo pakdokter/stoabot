@@ -170,9 +170,14 @@ def _is_item_name_line(line: str) -> bool:
         return False
     if len(line.strip()) < 2:
         return False
-    # Skip baris yang dimulai dengan tanda baca/simbol (bukan huruf/angka)
-    if re.match(r'^[^a-zA-Z0-9]', line.strip()):
-        return False
+    # Skip baris yang dimulai dengan tanda baca/simbol DAN tidak punya huruf item
+    # Pengecualian: baris seperti ":TUNE MYK.GRG RF2L 43100 129,300" tetap valid
+    stripped = line.strip()
+    if re.match(r'^[^a-zA-Z0-9]', stripped):
+        # Cek apakah setelah tanda baca ada nama item (huruf kapital)
+        after_punct = re.sub(r'^[^a-zA-Z0-9]+', '', stripped)
+        if not re.search(r'[A-Z]{2,}', after_punct):
+            return False
     if _matches_any(line, SKIP_LINE_PATTERNS):
         return False
     if _matches_any(line, TOTAL_KEYWORDS):
@@ -487,7 +492,13 @@ def _normalize_ocr(text: str) -> str:
     result = normalized.encode('ascii', 'ignore').decode('ascii')
     # Bersihkan karakter aneh yang sering muncul di OCR thermal
     result = result.replace('@', '').replace("'i", '').replace("'", '')
-    return result
+    # Bersihkan ":" atau spasi di awal baris item (OCR noise Indomaret)
+    # ":TUNE MYK.GRG RF2L" → "TUNE MYK.GRG RF2L"
+    lines_out = []
+    for line in result.splitlines():
+        cleaned = re.sub(r'^[:\s]+(?=[A-Z])', '', line)
+        lines_out.append(cleaned)
+    return '\n'.join(lines_out)
 
 
 def _parse_receipt_text(text: str) -> OcrResult:
@@ -498,15 +509,52 @@ def _parse_receipt_text(text: str) -> OcrResult:
     lines = _join_fragmented_lines(lines)
 
     # ── Merchant ──
-    header_skip = ['telp','fax','no.','no:','kasir','area','jl.',
-                   'jln','pel.','pelanggan','tanggal','date','struk']
-    for line in lines[:8]:
-        if re.match(r'^[\d\s\-\+\(\)\.\/:=,]+$', line): continue
-        if len(line) < 3: continue
-        if any(w in line.lower() for w in header_skip): continue
-        if _matches_any(line, SKIP_LINE_PATTERNS): continue
-        result.merchant = line.title()
-        break
+    # Deteksi nama toko terkenal dari seluruh teks
+    KNOWN_MERCHANTS = {
+        'indomaret': 'Indomaret',
+        'alfamart': 'Alfamart',
+        'alfamidi': 'Alfamidi',
+        'lawson': 'Lawson',
+        'circle k': 'Circle K',
+        'familymart': 'FamilyMart',
+        'hypermart': 'Hypermart',
+        'carrefour': 'Carrefour',
+        'lottemart': 'Lotte Mart',
+        'transmart': 'Transmart',
+        'superindo': 'Super Indo',
+        'giant': 'Giant',
+        'yogya': 'Yogya',
+        'borma': 'Borma',
+        'primo': 'Primo',
+        'primer raya': 'Primer Raya',
+        'dinda frozen': 'Dinda Frozen Food',
+        'sb minimarket': 'SB Minimarket',
+        'toko bahan kue': 'Toko Bahan Kue Amanah',
+        'stoa space': 'Stoa Space',
+    }
+
+    text_lower = text.lower()
+    for keyword, merchant_name in KNOWN_MERCHANTS.items():
+        if keyword in text_lower:
+            result.merchant = merchant_name
+            break
+
+    # Jika tidak ada known merchant, cari dari baris awal
+    if not result.merchant:
+        header_skip = ['telp','fax','no.','no:','kasir','area','jl.',
+                       'jln','pel.','pelanggan','tanggal','date','struk']
+        for line in lines[:8]:
+            if re.match(r'^[\d\s\-\+\(\)\.\/:=,]+$', line): continue
+            if len(line) < 3: continue
+            if any(w in line.lower() for w in header_skip): continue
+            if _matches_any(line, SKIP_LINE_PATTERNS): continue
+            # Skip baris yang hanya berisi kata-kata footer/OCR noise
+            words = re.findall(r'[a-zA-Z]+', line.lower())
+            if all(w in {'atama', 'evard', 'kapuk', 'karta', 'utara', 'domaret',
+                         'maret', 'prismatama', 'indomarco'} for w in words if len(w) > 2):
+                continue
+            result.merchant = line.title()
+            break
 
     # ── Tanggal ──
     for m in re.finditer(r'(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})', text):

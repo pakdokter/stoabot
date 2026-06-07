@@ -42,6 +42,8 @@ TOTAL_KEYWORDS = [
     r'\btotal\b', r'\bgrand\s*total\b', r'\bjumlah\b',
     r'\btagihan\b', r'\bsubtotal\b', r'\bsub\s*total\b',
     r'\bnetto\b', r'\bnet\b',
+    r'\btotal\s+belanja\b', r'\bjumlah\s+belanja\b',
+    r'\btotal\s+bayar\b', r'\btotal\s+pembayaran\b',
     # OCR noise variants
     r'\brotal\b', r'\bt0tal\b', r'\bt\*tal\b', r'\btoial\b',
 ]
@@ -52,9 +54,17 @@ PAYMENT_KEYWORDS = [
     r'\bdana\b', r'\blinkaja\b',
     # OCR noise variants
     r'\brunai\b', r'\btunal\b', r'\btumai\b', r'\bbayaf\b',
+    r'\btuna\s+i\b', r'\btunail\b',
 ]
 CHANGE_KEYWORDS = [
     r'\bkembali\b', r'\bkembalian\b', r'\bchange\b', r'\bselisih\b',
+    r'\bkenba\b', r'\bkemba\b',  # OCR noise
+]
+
+# Kata yang menandakan HEMAT/DISKON — bukan nilai transaksi  
+SAVINGS_KEYWORDS = [
+    r'\banda\s+hemat\b', r'\bhemat\b', r'\bvoucher\b',
+    r'\bpromo\b', r'\bcashback\b',
 ]
 DISCOUNT_KEYWORDS = [
     r'\bdiskon\b', r'\bdiscount\b', r'\bdisc\b', r'\bkorting\b',
@@ -94,6 +104,11 @@ NON_ITEM_WORDS = {
     'jl', 'jln', 'jalan', 'gg', 'gang', 'rt', 'rw', 'kel', 'kec',
     'area', 'pertokoan', 'mall', 'ruko', 'rukan', 'komplek',
     'selong', 'lombok', 'mataram', 'timur', 'barat', 'utara', 'selatan',
+    # Indomaret/minimarket footer words
+    'voucher', 'hemat', 'dpp', 'ppn', 'harga', 'jual', 'layanan',
+    'konsumen', 'kontak', 'belanja', 'klikindomaret', 'gratis',
+    'ongkir', 'sampai', 'mudah', 'telp', 'wa', 'swf', 'pwp',
+    'control', 'option', 'command',  # OCR noise dari UI elements
 }
 
 
@@ -157,6 +172,8 @@ def _is_item_name_line(line: str) -> bool:
         return False
     if _matches_any(line, TAX_KEYWORDS):
         return False
+    if _matches_any(line, SAVINGS_KEYWORDS):
+        return False
 
     # Cek apakah kata pertama adalah non-item word
     first_word = re.findall(r'[a-zA-Z]+', line.lower())
@@ -174,47 +191,60 @@ def _is_item_name_line(line: str) -> bool:
 
 def _parse_item_line_format_b(line: str) -> Optional[ReceiptItem]:
     """
-    Parse baris format B: "NAMA ITEM QTY UNIT PRICE TOTAL"
-    Contoh: "KLIP REC 650 ML 2 SLOP 35,000 70,000"
+    Parse baris format B.
+    Mendukung dua pola:
+    - "NAMA QTY UNIT HARGA TOTAL"   (PRIMER RAYA: KLIP REC 650 ML 2 SLOP 35,000 70,000)
+    - "NAMA QTY HARGA TOTAL"        (Indomaret: ITUNE MYK.GRG RF2L 3 43100 129,300)
     """
-    # Temukan semua angka + posisinya
-    money_vals = _extract_money(line)
+    # Hapus angka dalam kurung (voucher/diskon negatif): (2,100)
+    line_clean = re.sub(r'\([\d.,]+\)', '', line).strip()
+
+    money_vals = _extract_money(line_clean)
     if len(money_vals) < 1:
         return None
 
-    # Ambil 1-2 angka terakhir sebagai harga
-    if len(money_vals) >= 2:
-        line_total = money_vals[-1][0]
-        unit_price = money_vals[-2][0]
-        price_pos = money_vals[-2][1]
-    else:
-        line_total = money_vals[-1][0]
-        unit_price = line_total
-        price_pos = money_vals[-1][1]
+    # Ambil unit dan posisi pertama angka besar
+    first_money_pos = money_vals[0][1]
+    text_before_money = line_clean[:first_money_pos].strip()
 
-    # Nama item: teks sebelum angka pertama yang besar
-    # Hapus bagian qty+unit+harga dari akhir
-    name_end = money_vals[0][1] if money_vals else len(line)
+    # Cari unit di teks sebelum angka
+    unit = _extract_unit(text_before_money)
 
-    # Jika ada qty di depan nama, ambil setelah qty
-    name_part = line[:name_end].strip()
-
-    # Bersihkan unit dari nama
-    unit = _extract_unit(name_part)
+    # Cari qty — angka kecil (1-999) di antara nama dan harga
+    # Bersihkan unit dari text_before_money dulu
+    name_part = text_before_money
     if unit:
         name_part = re.sub(r'\b' + unit.lower() + r'\b', '', name_part, flags=re.IGNORECASE).strip()
 
-    # Bersihkan angka kecil (qty) dari nama
-    qty_match = re.search(r'\b(\d{1,3})\b', name_part)
+    # Cari qty di akhir name_part (angka kecil sebelum harga)
     qty = 1.0
+    qty_match = re.search(r'\b(\d{1,3})\s*$', name_part)
     if qty_match:
         qty_val = int(qty_match.group(1))
         if 1 <= qty_val <= 999:
             qty = float(qty_val)
-            name_part = name_part[:qty_match.start()] + name_part[qty_match.end():]
+            name_part = name_part[:qty_match.start()].strip()
+    else:
+        # Cek juga di seluruh text_before_money (untuk pola Indomaret)
+        qty_match2 = re.search(r'\t(\d{1,3})\t|\s{2,}(\d{1,3})\s{2,}', text_before_money)
+        if qty_match2:
+            qty_val = int(qty_match2.group(1) or qty_match2.group(2))
+            if 1 <= qty_val <= 999:
+                qty = float(qty_val)
+                # Hapus qty dari nama
+                name_part = text_before_money[:qty_match2.start()].strip()
+                if unit:
+                    name_part = re.sub(r'\b' + unit.lower() + r'\b', '', name_part, flags=re.IGNORECASE).strip()
 
-    name = name_part.strip().rstrip('-').strip()
+    # Pilih unit_price dan line_total
+    if len(money_vals) >= 2:
+        line_total = money_vals[-1][0]
+        unit_price = money_vals[-2][0]
+    else:
+        line_total = money_vals[-1][0]
+        unit_price = line_total
 
+    name = name_part.strip().rstrip('-').rstrip('.').strip()
     if len(name) < 2:
         return None
 
@@ -337,6 +367,7 @@ def _parse_items_format_b(lines: list) -> list:
 def _classify_line(line: str) -> str:
     if _matches_any(line, SKIP_LINE_PATTERNS): return 'skip'
     if _matches_any(line, CHANGE_KEYWORDS): return 'change'
+    if _matches_any(line, SAVINGS_KEYWORDS): return 'skip'   # hemat/voucher bukan item
     if _matches_any(line, PAYMENT_KEYWORDS): return 'payment'
     if _matches_any(line, TOTAL_KEYWORDS): return 'total'
     if _matches_any(line, DISCOUNT_KEYWORDS): return 'discount'

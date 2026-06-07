@@ -10,12 +10,16 @@ from bot.config import settings
 from bot.database import init_db
 from bot.handlers.auth import cmd_adduser, cmd_users
 from bot.handlers.transaction import (
-    build_belanja_conv,
     cmd_saldo, cmd_riwayat, cmd_cari,
     build_transaction_conv, build_edit_conv, build_hapus_conv,
 )
 from bot.handlers.report import cmd_ringkas, build_laporan_conv, build_statement_conv
 from bot.handlers.ocr import build_ocr_conv
+
+
+# ──────────────────────────────────────────────
+# Logging setup
+# ──────────────────────────────────────────────
 
 logger.remove()
 logger.add(
@@ -24,12 +28,37 @@ logger.add(
     level=settings.log_level,
 )
 
+
+# ──────────────────────────────────────────────
+# /start and /help
+# ──────────────────────────────────────────────
+
 async def cmd_start(update, context):
     from bot.handlers.auth import ensure_registered
+    from bot.database import AsyncSessionLocal
+    from bot.models import User
     if not await ensure_registered(update, context):
         return
+
+    user_id = update.effective_user.id
+    tg_name = update.effective_user.full_name or update.effective_user.first_name or ""
+
+    # Cek apakah user sudah punya nama di DB
+    async with AsyncSessionLocal() as session:
+        user = await session.get(User, user_id)
+        has_name = user and user.full_name and user.full_name != "no_username" and len(user.full_name) > 1
+
+    if not has_name:
+        context.user_data["waiting_name"] = True
+        await update.message.reply_text(
+            f"👋 Halo! Selamat datang di bot keuangan *{settings.business_name}*.\n\n"
+            f"Sebelum mulai, ketik *nama lengkap* kamu:",
+            parse_mode="Markdown",
+        )
+        return
+
     await update.message.reply_text(
-        f"👋 Halo *{update.effective_user.first_name}*!\n\n"
+        f"👋 Halo *{tg_name}*!\n\n"
         f"Saya adalah bot pencatat keuangan *{settings.business_name}*.\n\n"
         "*Perintah tersedia:*\n"
         "/masuk — catat pemasukan\n"
@@ -47,16 +76,55 @@ async def cmd_start(update, context):
         parse_mode="Markdown",
     )
 
+
+async def handle_name_input(update, context):
+    """Handler untuk input nama user saat /start pertama kali."""
+    if not context.user_data.get("waiting_name"):
+        return
+    name = update.message.text.strip()
+    if len(name) < 2:
+        await update.message.reply_text("❌ Nama terlalu pendek. Ketik nama lengkap kamu:")
+        return
+    user_id = update.effective_user.id
+    from bot.database import AsyncSessionLocal
+    from bot.models import User
+    async with AsyncSessionLocal() as session:
+        user = await session.get(User, user_id)
+        if user:
+            user.full_name = name
+            await session.commit()
+    context.user_data.pop("waiting_name", None)
+    await update.message.reply_text(
+        f"✅ Nama disimpan: *{name}*\n\n"
+        f"Sekarang kamu bisa mulai mencatat keuangan.\n\n"
+        "*Perintah tersedia:*\n"
+        "/masuk — catat pemasukan\n"
+        "/keluar — catat pengeluaran\n"
+        "/saldo — cek saldo\n"
+        "/riwayat — riwayat transaksi\n"
+        "/laporan — laporan per periode\n\n"
+        "📸 Kirim *foto struk* untuk input otomatis!",
+        parse_mode="Markdown",
+    )
+
+
 async def cmd_help(update, context):
     await cmd_start(update, context)
+
 
 async def unknown_command(update, context):
     await update.message.reply_text(
         "❓ Perintah tidak dikenali. Ketik /help untuk daftar perintah."
     )
 
+
+# ──────────────────────────────────────────────
+# Post init
+# ──────────────────────────────────────────────
+
 async def post_init(application: Application):
     await init_db()
+    logger.info("Database initialized")
     await application.bot.set_my_commands([
         BotCommand("masuk", "Catat pemasukan"),
         BotCommand("keluar", "Catat pengeluaran"),
@@ -72,6 +140,11 @@ async def post_init(application: Application):
     ])
     logger.info(f"Starting bot — {settings.business_name}")
 
+
+# ──────────────────────────────────────────────
+# App builder
+# ──────────────────────────────────────────────
+
 def create_app() -> Application:
     app = (
         Application.builder()
@@ -79,14 +152,16 @@ def create_app() -> Application:
         .post_init(post_init)
         .build()
     )
-    app.add_handler(build_belanja_conv())
+
     app.add_handler(build_transaction_conv())
     app.add_handler(build_edit_conv())
     app.add_handler(build_hapus_conv())
     app.add_handler(build_laporan_conv())
     app.add_handler(build_statement_conv())
     app.add_handler(build_ocr_conv())
+
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_name_input), group=99)
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("saldo", cmd_saldo))
     app.add_handler(CommandHandler("riwayat", cmd_riwayat))
@@ -95,7 +170,13 @@ def create_app() -> Application:
     app.add_handler(CommandHandler("adduser", cmd_adduser))
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+
     return app
+
+
+# ──────────────────────────────────────────────
+# Entry — gunakan run_polling langsung tanpa asyncio.run
+# ──────────────────────────────────────────────
 
 if __name__ == "__main__":
     app = create_app()

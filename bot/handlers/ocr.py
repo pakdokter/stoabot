@@ -20,8 +20,11 @@ from bot.services.audit import log_create
 from bot.utils.formatters import fmt_rupiah, fmt_date, parse_amount
 from bot.handlers.auth import ensure_registered
 
-OCR_KONFIRMASI = 50
+OCR_KONFIRMASI   = 50
 OCR_EDIT_NOMINAL = 51
+OCR_EDIT_MENU    = 52
+OCR_EDIT_MERCHANT = 53
+OCR_EDIT_DATE    = 54
 
 
 def _log(user_id, state, action, **kwargs):
@@ -86,7 +89,7 @@ async def _show_ocr_result(update: Update, result: OcrResult):
 
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Ya, simpan", callback_data="ocr:ya"),
-        InlineKeyboardButton("✏️ Edit nominal", callback_data="ocr:edit"),
+        InlineKeyboardButton("✏️ Edit", callback_data="ocr:edit"),
         InlineKeyboardButton("❌ Batal", callback_data="ocr:tidak"),
     ]])
 
@@ -131,19 +134,161 @@ async def ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await _do_save(query, context, user_id, from_query=True)
 
     if action == "edit":
+        _log(user_id, "WAITING_CONFIRMATION", "edit_menu_opened")
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏪 Nama Toko", callback_data="ocredit:merchant"),
+            InlineKeyboardButton("📅 Tanggal", callback_data="ocredit:date"),
+        ],[
+            InlineKeyboardButton("💰 Nominal", callback_data="ocredit:nominal"),
+            InlineKeyboardButton("❌ Batal", callback_data="ocr:tidak"),
+        ]])
+        try:
+            await query.edit_message_text(
+                "✏️ *Edit bagian mana?*", parse_mode="Markdown", reply_markup=keyboard
+            )
+        except Exception as e:
+            logger.error(f"[OCR] edit menu failed: {e}")
+        return OCR_EDIT_MENU
+
+    return OCR_KONFIRMASI
+
+
+async def ocr_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler tombol pilihan edit."""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    try:
+        await query.answer()
+    except Exception as e:
+        logger.warning(f"[OCR] query.answer failed: {e}")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    result: OcrResult = context.user_data.get("ocr_result")
+    if result is None:
+        try: await query.edit_message_text("⏰ Sesi habis. Kirim ulang foto struk.")
+        except Exception: pass
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    field = query.data.split(":")[1]
+
+    if field == "nominal":
         current = fmt_rupiah(result.total) if result.total else "belum terdeteksi"
         try:
             await query.edit_message_text(
-                f"✏️ Nominal saat ini: *{current}*\n\n"
-                f"Masukkan nominal yang benar:\n_(Contoh: 45000, 45rb, 1.5jt)_",
+                f"💰 Nominal saat ini: *{current}*\n\nMasukkan nominal baru:\n_(Contoh: 45000, 45rb)_",
                 parse_mode="Markdown",
             )
-        except Exception as e:
-            logger.error(f"[OCR] edit_message_text failed: {e}")
-            try: await query.message.reply_text("✏️ Masukkan nominal baru:", parse_mode="Markdown")
-            except Exception: pass
+        except Exception: pass
+        context.user_data["ocr_edit_field"] = "nominal"
         return OCR_EDIT_NOMINAL
 
+    if field == "merchant":
+        current = result.merchant or "tidak terdeteksi"
+        try:
+            await query.edit_message_text(
+                f"🏪 Nama toko saat ini: *{_esc(current)}*\n\nMasukkan nama toko yang benar:",
+                parse_mode="Markdown",
+            )
+        except Exception: pass
+        context.user_data["ocr_edit_field"] = "merchant"
+        return OCR_EDIT_MERCHANT
+
+    if field == "date":
+        current = fmt_date(result.tx_date) if result.tx_date else "hari ini"
+        try:
+            await query.edit_message_text(
+                f"📅 Tanggal saat ini: *{current}*\n\nMasukkan tanggal baru:\n_(Format: DD/MM/YYYY, contoh: 07/06/2026)_",
+                parse_mode="Markdown",
+            )
+        except Exception: pass
+        context.user_data["ocr_edit_field"] = "date"
+        return OCR_EDIT_DATE
+
+    return OCR_KONFIRMASI
+
+
+async def ocr_edit_merchant(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler input nama toko baru."""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    result: OcrResult = context.user_data.get("ocr_result")
+    if result is None:
+        await update.message.reply_text("⏰ Sesi habis.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    if len(text) < 2:
+        await update.message.reply_text("❌ Nama terlalu pendek.")
+        return OCR_EDIT_MERCHANT
+
+    result.merchant = text
+    context.user_data["ocr_result"] = result
+    context.user_data["ocr_edit_field"] = None
+    return await _show_ocr_confirm(update, result, from_edit=True)
+
+
+async def ocr_edit_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler input tanggal baru."""
+    from bot.utils.formatters import parse_date
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    result: OcrResult = context.user_data.get("ocr_result")
+    if result is None:
+        await update.message.reply_text("⏰ Sesi habis.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    new_date = parse_date(text)
+    if not new_date:
+        await update.message.reply_text(
+            "❌ Format tanggal tidak valid.\nContoh: `07/06/2026`",
+            parse_mode="Markdown"
+        )
+        return OCR_EDIT_DATE
+
+    result.tx_date = new_date
+    context.user_data["ocr_result"] = result
+    context.user_data["ocr_edit_field"] = None
+    return await _show_ocr_confirm(update, result, from_edit=True)
+
+
+async def _show_ocr_confirm(update: Update, result: OcrResult, from_edit: bool = False):
+    """Tampilkan preview terbaru setelah edit."""
+    lines = ["✅ *Data diperbarui*\n" if from_edit else "📄 *Hasil Baca Struk*\n"]
+    lines.append(f"Toko: *{_esc(result.merchant or 'tidak terdeteksi')}*")
+    lines.append(f"Tanggal: *{fmt_date(result.tx_date)}*" if result.tx_date else "Tanggal: _pakai hari ini_")
+
+    if result.items:
+        lines.append("\n🛒 *Item:*")
+        for item in result.items:
+            qty_str = f"({int(item.qty)}x) " if item.qty > 1 else ""
+            lines.append(f"  • {_esc(item.name)} {qty_str}— *{fmt_rupiah(item.line_total)}*")
+        lines.append(f"\nTotal Item: *{len(result.items)}*")
+    else:
+        lines.append("\n_Item tidak terdeteksi_")
+
+    if result.total:
+        lines.append(f"Total Belanja: *{fmt_rupiah(result.total)}*")
+        if result.cash_paid: lines.append(f"_Tunai: {fmt_rupiah(result.cash_paid)}_")
+        if result.change: lines.append(f"_Kembali: {fmt_rupiah(result.change)}_")
+    else:
+        lines.append("\nTotal: _belum terdeteksi_")
+
+    lines.append("\nSimpan sebagai pengeluaran?")
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Ya, simpan", callback_data="ocr:ya"),
+        InlineKeyboardButton("✏️ Edit lagi", callback_data="ocr:edit"),
+        InlineKeyboardButton("❌ Batal", callback_data="ocr:tidak"),
+    ]])
+
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode="Markdown", reply_markup=keyboard
+    )
     return OCR_KONFIRMASI
 
 
@@ -305,10 +450,22 @@ def build_ocr_conv() -> ConversationHandler:
                 CallbackQueryHandler(ocr_callback, pattern="^ocr:"),
                 MessageHandler(filters.PHOTO, handle_photo),
             ],
+            OCR_EDIT_MENU: [
+                CallbackQueryHandler(ocr_edit_menu, pattern="^ocredit:"),
+                CallbackQueryHandler(ocr_callback, pattern="^ocr:"),
+            ],
             OCR_EDIT_NOMINAL: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ocr_edit_nominal),
                 MessageHandler(filters.PHOTO, handle_photo),
                 CallbackQueryHandler(ocr_callback, pattern="^ocr:"),
+            ],
+            OCR_EDIT_MERCHANT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ocr_edit_merchant),
+                MessageHandler(filters.PHOTO, handle_photo),
+            ],
+            OCR_EDIT_DATE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ocr_edit_date),
+                MessageHandler(filters.PHOTO, handle_photo),
             ],
         },
         fallbacks=[],

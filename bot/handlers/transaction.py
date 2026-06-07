@@ -192,6 +192,7 @@ async def cmd_riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_registered(update, context):
         return
 
+    user_id = update.effective_user.id
     page = int(context.args[0]) if context.args else 0
     offset = page * PAGE_SIZE
 
@@ -239,6 +240,7 @@ async def cmd_cari(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_registered(update, context):
         return
 
+    user_id = update.effective_user.id
     keyword = " ".join(context.args).strip() if context.args else ""
     if not keyword:
         await update.message.reply_text("Gunakan: /cari <kata kunci>\nContoh: /cari kopi")

@@ -1,7 +1,6 @@
 """
-OCR Handler — fix: escape Markdown characters dari OCR output.
+OCR Handler — tampilkan item detail + total.
 """
-import re
 import traceback
 from datetime import date
 from loguru import logger
@@ -22,14 +21,6 @@ from bot.handlers.auth import ensure_registered
 
 OCR_KONFIRMASI = 50
 OCR_EDIT_NOMINAL = 51
-
-
-def _esc(text: str) -> str:
-    """Escape karakter Markdown agar tidak crash Telegram."""
-    if not text:
-        return text
-    # Escape: * _ ` [ ]
-    return re.sub(r'([*_`\[\]])', r'\\\1', str(text))
 
 
 def _log(user_id, state, action, **kwargs):
@@ -61,23 +52,26 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _show_ocr_result(update: Update, result: OcrResult):
+    """Tampilkan hasil OCR dengan rincian item."""
     lines = ["📄 *Hasil Baca Struk*\n"]
-    lines.append(f"Toko: *{_esc(result.merchant or 'tidak terdeteksi')}*")
+    lines.append(f"Toko: *{result.merchant or 'tidak terdeteksi'}*")
 
     if result.tx_date:
         lines.append(f"Tanggal: *{fmt_date(result.tx_date)}*")
     else:
         lines.append("Tanggal: _tidak terdeteksi_ (pakai hari ini)")
 
+    # ── Rincian item ──
     if result.items:
         lines.append("\n🛒 *Item:*")
         for item in result.items:
             qty_str = f"({int(item.qty)}x) " if item.qty > 1 else ""
-            lines.append(f"  • {_esc(item.name)} {qty_str}— *{fmt_rupiah(item.line_total)}*")
+            lines.append(f"  • {item.name} {qty_str}— *{fmt_rupiah(item.line_total)}*")
         lines.append(f"\nTotal Item: *{len(result.items)}*")
     else:
         lines.append("\n_Item tidak terdeteksi_")
 
+    # ── Total belanja ──
     if result.total:
         lines.append(f"Total Belanja: *{fmt_rupiah(result.total)}*")
         if result.cash_paid:
@@ -114,6 +108,10 @@ async def ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     result: OcrResult = context.user_data.get("ocr_result")
+    _log(user_id, "WAITING_CONFIRMATION", "callback",
+         data=query.data, result_exists=result is not None,
+         total=result.total if result else None)
+
     if result is None:
         try: await query.edit_message_text("⏰ Sesi habis. Kirim ulang foto struk.")
         except Exception: pass
@@ -141,7 +139,7 @@ async def ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             logger.error(f"[OCR] edit_message_text failed: {e}")
-            try: await query.message.reply_text("✏️ Masukkan nominal baru:")
+            try: await query.message.reply_text("✏️ Masukkan nominal baru:", parse_mode="Markdown")
             except Exception: pass
         return OCR_EDIT_NOMINAL
 
@@ -151,6 +149,7 @@ async def ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ocr_edit_nominal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
+    logger.info(f"=== EDIT_AMOUNT RECEIVED ===\nInput: {text!r}\nSession: {list(context.user_data.keys())}\n===")
 
     result: OcrResult = context.user_data.get("ocr_result")
     if result is None:
@@ -171,14 +170,15 @@ async def ocr_edit_nominal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     merchant = result.merchant or "Belanja (struk)"
     tx_date = result.tx_date or date.today()
 
-    lines = ["✅ Nominal diperbarui.\n"]
+    # Tampilkan preview dengan item jika ada
+    lines = [f"✅ Nominal diperbarui.\n"]
     if result.items:
         lines.append("🛒 *Item:*")
         for item in result.items:
             qty_str = f"({int(item.qty)}x) " if item.qty > 1 else ""
-            lines.append(f"  • {_esc(item.name)} {qty_str}— *{fmt_rupiah(item.line_total)}*")
+            lines.append(f"  • {item.name} {qty_str}— *{fmt_rupiah(item.line_total)}*")
         lines.append(f"\nTotal Item: *{len(result.items)}*")
-    lines.append(f"Toko: *{_esc(merchant)}*")
+    lines.append(f"Toko: *{merchant}*")
     lines.append(f"Tanggal: *{fmt_date(tx_date)}*")
     lines.append(f"Total Belanja: *{fmt_rupiah(amount)}*\n\nSimpan?")
 
@@ -196,12 +196,14 @@ async def _do_save(update_or_query, context, user_id, from_query):
     file_id = context.user_data.get("ocr_file_id", "")
 
     if not result:
+        logger.error(f"[OCR] uid={user_id} _do_save: no ocr_result")
         return ConversationHandler.END
 
     amount = result.total or 0
     merchant = result.merchant or "Belanja (struk)"
     tx_date = result.tx_date or date.today()
 
+    # Buat deskripsi lengkap dengan item
     if result.items:
         item_desc = ", ".join(
             f"{item.name}{'x'+str(int(item.qty)) if item.qty > 1 else ''}"
@@ -210,14 +212,18 @@ async def _do_save(update_or_query, context, user_id, from_query):
         description = f"{merchant} ({item_desc})"
     else:
         description = merchant
+
     description = description[:200]
+
+    logger.info(f"=== BEFORE SAVE ===\nuid={user_id} amount={amount} desc={description!r}\n===")
 
     if amount <= 0:
         msg = "❌ Nominal belum diset. Gunakan ✏️ Edit nominal."
         try:
             if from_query: await update_or_query.edit_message_text(msg)
             else: await update_or_query.message.reply_text(msg)
-        except Exception: pass
+        except Exception as e:
+            logger.error(f"[OCR] reply failed: {e}")
         context.user_data.clear()
         return ConversationHandler.END
 
@@ -238,16 +244,18 @@ async def _do_save(update_or_query, context, user_id, from_query):
                 ))
             await log_create(session, user_id, tx)
             await session.commit()
+            logger.info(f"[OCR] saved tx_id={tx_id}")
 
         async with AsyncSessionLocal() as session2:
-            saldo = await get_running_balance(session2)
+            saldo = await get_running_balance(session2, user_id=user_id)
 
+        # Pesan sukses dengan rincian item
         lines = ["✅ *Transaksi berhasil disimpan*\n"]
         if result.items:
             lines.append("🛒 *Rincian:*")
             for item in result.items:
                 qty_str = f"({int(item.qty)}x) " if item.qty > 1 else ""
-                lines.append(f"  • {_esc(item.name)} {qty_str}— {fmt_rupiah(item.line_total)}")
+                lines.append(f"  • {item.name} {qty_str}— {fmt_rupiah(item.line_total)}")
             lines.append(f"\nTotal Item: *{len(result.items)}*")
         lines.append(f"Jenis: ➖ KELUAR")
         lines.append(f"Total Belanja: *{fmt_rupiah(amount)}*")
@@ -255,6 +263,7 @@ async def _do_save(update_or_query, context, user_id, from_query):
         lines.append(f"\n💰 Saldo saat ini:\n*{fmt_rupiah(saldo)}*")
 
         msg = "\n".join(lines)
+
         try:
             if from_query: await update_or_query.edit_message_text(msg, parse_mode="Markdown")
             else: await update_or_query.message.reply_text(msg, parse_mode="Markdown")

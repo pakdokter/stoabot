@@ -157,7 +157,9 @@ async def handle_tanggal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💰 Saldo saat ini:\n*{fmt_rupiah(saldo)}*",
         parse_mode="Markdown",
     )
+    _p = {k: context.user_data[k] for k in ("session_verified","db_user") if k in context.user_data}
     context.user_data.clear()
+    context.user_data.update(_p)
     return ConversationHandler.END
 
 
@@ -378,7 +380,9 @@ async def edit_input_nilai(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Transaksi berhasil diperbarui.\n\n💰 Saldo saat ini: *{fmt_rupiah(saldo)}*",
         parse_mode="Markdown",
     )
+    _p = {k: context.user_data[k] for k in ("session_verified","db_user") if k in context.user_data}
     context.user_data.clear()
+    context.user_data.update(_p)
     return ConversationHandler.END
 
 
@@ -442,7 +446,9 @@ async def hapus_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────────────
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _p = {k: context.user_data[k] for k in ("session_verified","db_user") if k in context.user_data}
     context.user_data.clear()
+    context.user_data.update(_p)
     await update.message.reply_text("❌ Dibatalkan.")
     return ConversationHandler.END
 

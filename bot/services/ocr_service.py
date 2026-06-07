@@ -65,6 +65,9 @@ CHANGE_KEYWORDS = [
 SAVINGS_KEYWORDS = [
     r'\banda\s+hemat\b', r'\bhemat\b', r'\bvoucher\b',
     r'\bpromo\b', r'\bcashback\b',
+    r'\bharga\s+jual\b', r'\brga\s+jual\b',
+    r'\bdpp\s*=\b', r'\bppn\s*=\b',
+    r'\bpwp\b', r'\blp\s+\d\b',
 ]
 DISCOUNT_KEYWORDS = [
     r'\bdiskon\b', r'\bdiscount\b', r'\bdisc\b', r'\bkorting\b',
@@ -80,6 +83,11 @@ SKIP_LINE_PATTERNS = [
     r'\bterima kasih\b', r'\bjangan lupa\b', r'\bdatang kembali\b',
     r'\bpowered by\b', r'\bcopyright\b',
     r'^\s*[-=*_]{3,}\s*$',
+    r'\d{2}\.\d{2}\.\d{2}-\d{2}:\d{2}',  # timestamp: 06.26-08:52
+    r'\d+/\d+\.\d+\.\d+/',               # nomor struk: 4.2.1/T06C
+    r'\bpwp\s+\d{10,}\b',                  # PWP 0013379946092000
+    r'\blp\s+\d{6,}\b',                    # LP 1500280
+    r'\bswa\b', r'\bkontak@\b',             # footer Indomaret
 ]
 
 # Unit-unit umum di struk Indonesia
@@ -109,6 +117,7 @@ NON_ITEM_WORDS = {
     'konsumen', 'kontak', 'belanja', 'klikindomaret', 'gratis',
     'ongkir', 'sampai', 'mudah', 'telp', 'wa', 'swf', 'pwp',
     'control', 'option', 'command',  # OCR noise dari UI elements
+    'rga', 've', 'lp', 'men', 'maret', 'domaret', 'indomaret',
 }
 
 
@@ -127,7 +136,8 @@ def _extract_money(text: str) -> list:
         raw = m.group(0).replace('.', '').replace(',', '')
         if raw.isdigit():
             val = float(raw)
-            if val >= 100:
+            # Filter: minimal 100, maksimal 100 juta (harga belanja wajar)
+            if 100 <= val <= 100_000_000:
                 results.append((val, m.start()))
     return results  # list of (value, position)
 
@@ -159,6 +169,9 @@ def _is_item_name_line(line: str) -> bool:
     if not re.search(r'[a-zA-Z]', line):
         return False
     if len(line.strip()) < 2:
+        return False
+    # Skip baris yang dimulai dengan tanda baca/simbol (bukan huruf/angka)
+    if re.match(r'^[^a-zA-Z0-9]', line.strip()):
         return False
     if _matches_any(line, SKIP_LINE_PATTERNS):
         return False

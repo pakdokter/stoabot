@@ -4,7 +4,7 @@ Main entrypoint — assembles all handlers and starts the bot.
 import sys
 from loguru import logger
 from telegram import Update, BotCommand
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 
 from bot.config import settings
 from bot.database import init_db

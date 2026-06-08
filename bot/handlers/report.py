@@ -47,8 +47,12 @@ async def cmd_ringkas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     days_passed = (today - first_day).days + 1
     avg_keluar = summary["total_keluar"] / days_passed if days_passed > 0 else 0
 
+    db_user = context.user_data.get("db_user")
+    user_name = db_user.full_name if db_user else update.effective_user.full_name or "User"
+
     await update.message.reply_text(
-        f"📊 *Ringkasan Bulan Ini*\n"
+        f"📊 *Ringkasan Laporan Keuangan*\n"
+        f"👤 {user_name}\n"
         f"_{fmt_date_full(first_day)} — {fmt_date_full(today)}_\n\n"
         f"Pemasukan:\n*{fmt_rupiah(summary['total_masuk'])}*\n\n"
         f"Pengeluaran:\n*{fmt_rupiah(summary['total_keluar'])}*\n\n"
@@ -172,6 +176,13 @@ async def _show_laporan(update_or_query, user_id: int, date_from: date, date_to:
         )
         txs = result.scalars().all()
 
+    # Ambil nama user
+    from bot.database import AsyncSessionLocal as _ASL
+    from bot.models import User as _User
+    async with _ASL() as _s:
+        _u = await _s.get(_User, user_id)
+        user_name = _u.full_name if _u else str(user_id)
+
     # Label periode
     if date_from == date_to:
         periode = f"📅 {fmt_date(date_from)}"
@@ -179,7 +190,9 @@ async def _show_laporan(update_or_query, user_id: int, date_from: date, date_to:
         periode = f"📅 {fmt_date(date_from)} s/d {fmt_date(date_to)}"
 
     lines = [
-        f"📊 *Laporan Transaksi*\n{periode}\n",
+        f"📊 *Laporan Transaksi*\n"
+        f"👤 {user_name}\n"
+        f"{periode}\n",
         f"Total Masuk: *{fmt_rupiah(summary['total_masuk'])}*",
         f"Total Keluar: *{fmt_rupiah(summary['total_keluar'])}*",
         f"Saldo Periode: *{fmt_rupiah(summary['saldo'])}*",
@@ -293,10 +306,16 @@ async def _generate_statement(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         pdf_bytes = generate_statement_pdf(txs, date_from, date_to, saldo_awal)
         filename = f"statement_{year}_{month:02d}.pdf"
+        from bot.database import AsyncSessionLocal as _ASL
+        from bot.models import User as _User
+        async with _ASL() as _s:
+            _u = await _s.get(_User, user_id)
+            user_name = _u.full_name if _u else str(user_id)
+
         await update.message.reply_document(
             document=io.BytesIO(pdf_bytes),
             filename=filename,
-            caption=f"📄 E-Statement {date_from.strftime('%B %Y')}",
+            caption=f"📄 E-Statement {date_from.strftime('%B %Y')} — {user_name}",
         )
     except Exception as e:
         logger.error(f"PDF generation failed: {e}")

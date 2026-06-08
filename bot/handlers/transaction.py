@@ -84,6 +84,9 @@ async def cmd_masuk(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_keluar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_registered(update, context):
         return ConversationHandler.END
+    _p = {k: context.user_data[k] for k in ("session_verified","db_user") if k in context.user_data}
+    context.user_data.clear()
+    context.user_data.update(_p)
     context.user_data["tx_type"] = "keluar"
     await update.message.reply_text("💸 *Catat Pengeluaran*\n\nNominal?", parse_mode="Markdown")
     return TX_NOMINAL
@@ -194,11 +197,20 @@ async def cmd_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_registered(update, context):
         return
 
-    async with AsyncSessionLocal() as session:
-        summary = await get_summary(session, user_id=user_id)
+    user_id = update.effective_user.id
+    try:
+        async with AsyncSessionLocal() as session:
+            summary = await get_summary(session, user_id=user_id)
+    except Exception as e:
+        logger.error(f"[SALDO] error uid={user_id}: {e}")
+        summary = {"saldo": 0, "total_masuk": 0, "total_keluar": 0, "jumlah": 0}
+
+    db_user = context.user_data.get("db_user")
+    user_name = db_user.full_name if db_user else update.effective_user.first_name or "User"
 
     await update.message.reply_text(
-        f"💰 *Saldo saat ini:*\n*{fmt_rupiah(summary['saldo'])}*\n\n"
+        f"💰 *Saldo — {user_name}*\n\n"
+        f"Saldo saat ini:\n*{fmt_rupiah(summary['saldo'])}*\n\n"
         f"Total pemasukan:\n{fmt_rupiah(summary['total_masuk'])}\n\n"
         f"Total pengeluaran:\n{fmt_rupiah(summary['total_keluar'])}",
         parse_mode="Markdown",
@@ -313,6 +325,7 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_registered(update, context):
         return ConversationHandler.END
 
+    user_id = update.effective_user.id
     async with AsyncSessionLocal() as session:
         txs = await _recent_transactions(session, 10, user_id=user_id)
 
@@ -429,6 +442,7 @@ async def cmd_hapus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_registered(update, context):
         return ConversationHandler.END
 
+    user_id = update.effective_user.id
     async with AsyncSessionLocal() as session:
         txs = await _recent_transactions(session, 10, user_id=user_id)
 

@@ -231,58 +231,97 @@ async def cmd_statement(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     today = date.today()
+
+    # Buat tombol 6 bulan terakhir + opsi bulan lain
+    buttons = []
+    row = []
+    for i in range(5, -1, -1):
+        from dateutil.relativedelta import relativedelta
+        d = today - relativedelta(months=i)
+        label = d.strftime("%b %Y")
+        cb = f"stmt:{d.month}:{d.year}"
+        row.append(InlineKeyboardButton(label, callback_data=cb))
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("✏️ Bulan lain", callback_data="stmt:other")])
+
     await update.message.reply_text(
-        f"📄 *E-Statement PDF*\n\nBulan? (1-12, contoh: 6 untuk Juni)\n"
-        f"Atau ketik `sekarang` untuk bulan ini ({today.month}/{today.year})",
+        "📄 *E-Statement PDF*\n\nPilih bulan:",
         parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
     )
     return STMT_BULAN
 
 
+async def stmt_bulan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler tombol pilihan bulan statement."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    data = query.data  # "stmt:6:2026" atau "stmt:other"
+    if data == "stmt:other":
+        try:
+            await query.edit_message_text(
+                "Ketik bulan dan tahun:\n_(contoh: 6/2026 atau 06/2026)_",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        return STMT_TAHUN
+
+    parts = data.split(":")
+    month = int(parts[1])
+    year = int(parts[2])
+    context.user_data["stmt_month"] = month
+    context.user_data["stmt_year"] = year
+    return await _generate_statement(query, context)
+
+
 async def stmt_bulan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().lower()
+    """Input manual bulan/tahun — dipakai saat user klik Bulan lain."""
+    text = update.message.text.strip()
     today = date.today()
 
-    if text in ("sekarang", "ini", "now"):
-        context.user_data["stmt_month"] = today.month
-        context.user_data["stmt_year"] = today.year
-        return await _generate_statement(update, context)
+    # Format: "6/2026" atau "6 2026" atau "06/2026"
+    m = re.match(r'^(\d{1,2})[/\s](\d{4})$', text)
+    if m:
+        month = int(m.group(1))
+        year = int(m.group(2))
+        if 1 <= month <= 12 and 2000 <= year <= 2100:
+            context.user_data["stmt_month"] = month
+            context.user_data["stmt_year"] = year
+            return await _generate_statement(update, context)
 
-    try:
-        month = int(text)
-        if not 1 <= month <= 12:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ Masukkan angka bulan (1-12).")
-        return STMT_BULAN
-
-    context.user_data["stmt_month"] = month
-    await update.message.reply_text(f"Tahun? (contoh: {today.year})")
+    await update.message.reply_text("❌ Format tidak valid. Contoh: 6/2026 atau 06/2026")
     return STMT_TAHUN
 
 
 async def stmt_tahun(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        year = int(update.message.text.strip())
-        if year < 2000 or year > 2100:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ Tahun tidak valid.")
-        return STMT_TAHUN
-
-    context.user_data["stmt_year"] = year
-    return await _generate_statement(update, context)
+    """Alias untuk stmt_bulan — dipakai di state STMT_TAHUN."""
+    return await stmt_bulan(update, context)
 
 
-async def _generate_statement(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _generate_statement(update_or_query, context: ContextTypes.DEFAULT_TYPE):
     month = context.user_data["stmt_month"]
     year = context.user_data["stmt_year"]
-    user_id = update.effective_user.id
+    # Support both Update (message) dan CallbackQuery
+    if hasattr(update_or_query, 'effective_user'):
+        user_id = update_or_query.effective_user.id
+        reply_target = update_or_query.message
+    else:
+        user_id = update_or_query.from_user.id
+        reply_target = update_or_query.message
     date_from = date(year, month, 1)
     last_day = monthrange(year, month)[1]
     date_to = date(year, month, last_day)
 
-    await update.message.reply_text("⏳ Membuat PDF statement...")
+    await reply_target.reply_text("⏳ Membuat PDF statement...")
 
     async with AsyncSessionLocal() as session:
         result = await session.execute(
@@ -312,14 +351,14 @@ async def _generate_statement(update: Update, context: ContextTypes.DEFAULT_TYPE
             _u = await _s.get(_User, user_id)
             user_name = _u.full_name if _u else str(user_id)
 
-        await update.message.reply_document(
+        await reply_target.reply_document(
             document=io.BytesIO(pdf_bytes),
             filename=filename,
             caption=f"📄 E-Statement {date_from.strftime('%B %Y')} — {user_name}",
         )
     except Exception as e:
         logger.error(f"PDF generation failed: {e}")
-        await update.message.reply_text("❌ Gagal membuat PDF. Coba lagi.")
+        await reply_target.reply_text("❌ Gagal membuat PDF. Coba lagi.")
 
     _p = {k: context.user_data[k] for k in ("session_verified", "db_user") if k in context.user_data}
     context.user_data.clear()
@@ -363,8 +402,13 @@ def build_statement_conv() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[CommandHandler("statement", cmd_statement)],
         states={
-            STMT_BULAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, stmt_bulan)],
-            STMT_TAHUN: [MessageHandler(filters.TEXT & ~filters.COMMAND, stmt_tahun)],
+            STMT_BULAN: [
+                CallbackQueryHandler(stmt_bulan_callback, pattern="^stmt:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, stmt_bulan),
+            ],
+            STMT_TAHUN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, stmt_tahun),
+            ],
         },
         fallbacks=[CommandHandler("batal", cmd_cancel)],
         allow_reentry=True,

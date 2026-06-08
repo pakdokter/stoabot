@@ -356,19 +356,7 @@ async def _do_save(update_or_query, context, user_id, from_query):
     merchant = result.merchant or "Belanja (struk)"
     tx_date = result.tx_date or date.today()
 
-    # Buat deskripsi lengkap dengan item
-    if result.items:
-        item_desc = ", ".join(
-            f"{item.name}{'x'+str(int(item.qty)) if item.qty > 1 else ''}"
-            for item in result.items
-        )
-        description = f"{merchant} ({item_desc})"
-    else:
-        description = merchant
-
-    description = description[:200]
-
-    logger.info(f"=== BEFORE SAVE ===\nuid={user_id} amount={amount} desc={description!r}\n===")
+    logger.info(f"=== BEFORE SAVE ===\nuid={user_id} amount={amount} merchant={merchant!r}\n===")
 
     if amount <= 0:
         msg = "❌ Nominal belum diset. Gunakan ✏️ Edit nominal."
@@ -380,15 +368,29 @@ async def _do_save(update_or_query, context, user_id, from_query):
         context.user_data.clear()
         return ConversationHandler.END
 
+    # Jika ada item terdeteksi → simpan per item sebagai transaksi terpisah
+    # Jika tidak ada item → simpan satu transaksi dengan total
+    transactions_to_save = []
+    if result.items:
+        for item in result.items:
+            qty_str = f" x{int(item.qty)}" if item.qty > 1 else ""
+            desc = f"{merchant} — {item.name}{qty_str}"[:200]
+            transactions_to_save.append((item.line_total, desc))
+    else:
+        transactions_to_save.append((amount, merchant))
+
     try:
         async with AsyncSessionLocal() as session:
-            tx = Transaction(
-                user_id=user_id, type="keluar", amount=amount,
-                description=description, transaction_date=tx_date,
-            )
-            session.add(tx)
-            await session.flush()
-            tx_id = tx.id
+            saved_ids = []
+            for tx_amount, tx_desc in transactions_to_save:
+                tx = Transaction(
+                    user_id=user_id, type="keluar", amount=tx_amount,
+                    description=tx_desc, transaction_date=tx_date,
+                )
+                session.add(tx)
+                await session.flush()
+                saved_ids.append(tx.id)
+            tx_id = saved_ids[0]
             if file_id:
                 session.add(Attachment(
                     transaction_id=tx_id, telegram_file_id=file_id,
@@ -397,25 +399,26 @@ async def _do_save(update_or_query, context, user_id, from_query):
                 ))
             await log_create(session, user_id, tx)
             await session.commit()
-            logger.info(f"[OCR] saved tx_id={tx_id}")
+            logger.info(f"[OCR] saved {len(saved_ids)} tx(s), first_id={tx_id}")
 
         async with AsyncSessionLocal() as session2:
             saldo = await get_running_balance(session2, user_id=user_id)
 
-        # Simpan ke Google Sheets
+        # Simpan ke Google Sheets — per item
         db_user = context.user_data.get("db_user")
         user_name = db_user.full_name if db_user else str(user_id)
-        await sheets_append(
-            user_id=user_id, user_name=user_name,
-            tx_type="keluar", amount=amount,
-            description=description, tx_date=tx_date,
-            source="struk",
-        )
+        for tx_amount, tx_desc in transactions_to_save:
+            await sheets_append(
+                user_id=user_id, user_name=user_name,
+                tx_type="keluar", amount=tx_amount,
+                description=tx_desc, tx_date=tx_date,
+                source="struk",
+            )
 
         # Pesan sukses dengan rincian item
         lines = ["✅ *Transaksi berhasil disimpan*\n"]
         if result.items:
-            lines.append("🛒 *Rincian:*")
+            lines.append("🛒 *Rincian (per item):*")
             for item in result.items:
                 qty_str = f"({int(item.qty)}x) " if item.qty > 1 else ""
                 lines.append(f"  • {item.name} {qty_str}— {fmt_rupiah(item.line_total)}")

@@ -73,6 +73,9 @@ SAVINGS_KEYWORDS = [
     r'\btotal\s+qty\b', r'\bjml\s+item\b',
     r'\bppn\s+included\b', r'\bitem\(s\)\b', r'\bqty\(s\)\b',
     r'\bincluded\s+in\s+total\b',
+    r'\bppn\s+dibebaskan\b', r'\bpkp\s+dibebaskan\b',
+    r'\bharga\s+jual\b', r'\brga\s+jual\b',
+    r'\bdpp\s*=', r'\bnpwp\b',
 ]
 DISCOUNT_KEYWORDS = [
     r'\bdiskon\b', r'\bdiscount\b', r'\bdisc\b', r'\bkorting\b',
@@ -673,6 +676,122 @@ def _normalize_ocr(text: str) -> str:
 
 
 
+
+def _is_klikindo_screenshot(text: str) -> bool:
+    """Deteksi screenshot detail pesanan Sukanda / Klikindomaret / app distributor."""
+    indicators = [
+        r'\bharga\s+satuan\b',
+        r'\bdikirim\s+ke\b',
+        r'\bberanda\b',
+        r'\bbeli\s+lagi\b',
+        r'\b\d{8,}\b',   # SKU angka panjang
+    ]
+    text_lower = text.lower()
+    hits = sum(1 for p in indicators if re.search(p, text_lower))
+    return hits >= 2 and re.search(r'Harga Satuan', text, re.IGNORECASE) is not None
+
+
+def _parse_klikindo_orders(text: str) -> OcrResult:
+    """
+    Parse screenshot detail pesanan Klikindomaret/Tokopedia.
+
+    Pola per item:
+      NAMA ITEM • detail  x1/x2/...
+      SKU_ANGKA
+      Harga Satuan        RpXXX
+      Total               RpXXX
+    """
+    from datetime import date as _date
+    result = OcrResult(raw_text=text)
+
+    # Deteksi nama tujuan dari "Dikirim ke: NAMA TOKO"
+    dikirim_m = re.search(r'Dikirim\s+ke\s*:\s*([A-Z][A-Z\s]+?)(?:\t|\n|$)', text)
+    if dikirim_m:
+        dest = dikirim_m.group(1).strip().title()
+        result.merchant = f"Sukanda ({dest})"
+    elif re.search(r'klikindomaret', text, re.IGNORECASE):
+        result.merchant = "Klikindomaret"
+    elif re.search(r'tokopedia', text, re.IGNORECASE):
+        result.merchant = "Tokopedia"
+    else:
+        result.merchant = "Pesanan Online"
+
+    result.tx_date = _date.today()
+
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    items = []
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+
+        # Baris "Total   RpXXX" → ini total per item
+        total_match = re.match(r'^Total\s+Rp([\d.,]+)$', line, re.IGNORECASE)
+        if total_match:
+            raw = total_match.group(1).replace('.', '').replace(',', '')
+            if raw.isdigit():
+                line_total = float(raw)
+                # Ambil nama item dari baris sebelumnya (skip SKU dan Harga Satuan)
+                name = None
+                qty = 1.0
+                unit_price = line_total
+                # Cari ke belakang
+                j = i - 1
+                while j >= 0:
+                    prev = lines[j]
+                    # Harga Satuan line
+                    hs = re.match(r'^Harga Satuan\s+Rp([\d.,]+)$', prev, re.IGNORECASE)
+                    if hs:
+                        raw2 = hs.group(1).replace('.', '').replace(',', '')
+                        if raw2.isdigit():
+                            unit_price = float(raw2)
+                        j -= 1
+                        continue
+                    # SKU angka murni (8+ digit)
+                    if re.match(r'^\d{6,}$', prev.strip()):
+                        j -= 1
+                        continue
+                    # Baris nama item — ada huruf dan bukan Rp/Total/Harga
+                    if (re.search(r'[A-Za-z]', prev) and
+                        not re.match(r'^(Rp|Total|Harga|Beli|Beranda)', prev, re.IGNORECASE)):
+                        # Ambil qty dari "x1", "x2" dll
+                        qty_m = re.search(r'[xX](\d+)\s*$', prev)
+                        if qty_m:
+                            qty = float(qty_m.group(1))
+                        # Bersihkan nama
+                        name_clean = re.sub(r'\s+[xX]\d+\s*$', '', prev).strip()
+                        name_clean = re.sub(r'\t.*', '', name_clean).strip()
+                        # Hapus "Brand • " prefix jika ada
+                        name_clean = re.sub(r'^[A-Za-z\s]+ • ', '', name_clean).strip()
+                        if len(name_clean) >= 3:
+                            name = name_clean
+                        break
+                    break
+
+                if name and line_total >= 100:
+                    items.append(ReceiptItem(
+                        name=name.upper()[:60],
+                        qty=qty,
+                        unit="",
+                        unit_price=unit_price,
+                        line_total=line_total,
+                    ))
+        i += 1
+
+    total = sum(item.line_total for item in items) if items else None
+    result.items = items
+    result.total = total
+    result.grand_total = total
+
+    score = 0.3
+    score += 0.4 if items else 0.0
+    score += 0.3 if total else 0.0
+    result.confidence = round(score, 2)
+
+    logger.info(f"[OCR] Klikindomaret: {len(items)} items total={total}")
+    return result
+
+
 def _is_shopee_screenshot(text: str) -> bool:
     """Deteksi apakah ini screenshot halaman pesanan Shopee/marketplace."""
     indicators = [
@@ -789,7 +908,11 @@ def _parse_receipt_text(text: str) -> OcrResult:
     # Normalisasi dulu sebelum parsing
     text = _normalize_ocr(text)
 
-    # Deteksi format Shopee/marketplace lebih dulu
+    # Deteksi format marketplace/app lebih dulu
+    if _is_klikindo_screenshot(text):
+        logger.info("[OCR] Klikindomaret/app screenshot detected")
+        return _parse_klikindo_orders(text)
+
     if _is_shopee_screenshot(text):
         logger.info("[OCR] Shopee screenshot detected")
         return _parse_shopee_orders(text)

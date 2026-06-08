@@ -615,6 +615,13 @@ def _join_fragmented_lines(lines: list) -> list:
             i += 1
             continue
 
+        # Baris "MI" / "ML" / "MG" pendek setelah baris item → sambung ke atas
+        # Contoh: "Diamond Sleeve 1000\tx5" + "MI" → unit yang terpisah
+        if re.match(r'^M[IiLlGg]$', line.strip()) and result:
+            result[-1] = result[-1] + ' ' + line.strip()
+            i += 1
+            continue
+
         # Baris qty+unit TANPA harga → cek baris berikutnya
         if _has_qty(line) and _has_unit(line) and not _has_money(line):
             if i + 1 < len(lines):
@@ -671,6 +678,10 @@ def _normalize_ocr(text: str) -> str:
         cleaned = cleaned.replace('к', 'R')   # кр → Rp (Cyrillic к)
         cleaned = cleaned.replace('К', 'R')
         cleaned = re.sub(r'(?<=[\d])O(?=[\d,.])', '0', cleaned)  # huruf O di antara angka
+        # "RD363.636" → "Rp363.636" (OCR noise: D bukan p)
+        cleaned = re.sub(r'\bRD(\d)', r'Rp\1', cleaned)
+        # "MI" di baris sendiri setelah nama item → kemungkinan "Ml" (mililiter)
+        # handled di join_fragmented
         lines_out.append(cleaned)
     return '\n'.join(lines_out)
 
@@ -688,7 +699,11 @@ def _is_klikindo_screenshot(text: str) -> bool:
     ]
     text_lower = text.lower()
     hits = sum(1 for p in indicators if re.search(p, text_lower))
-    return hits >= 2 and re.search(r'Harga Satuan', text, re.IGNORECASE) is not None
+    # Cukup 1 hit + Harga Satuan untuk format Sukanda/app distributor
+    # Karena screenshot bisa terpotong (tanpa header lengkap)
+    has_harga_satuan = re.search(r'Harga Satuan', text, re.IGNORECASE) is not None
+    has_total_produk = re.search(r'Total\s+Rp[\d.,]+', text) is not None
+    return has_harga_satuan and (hits >= 1 or has_total_produk)
 
 
 def _parse_klikindo_orders(text: str) -> OcrResult:
@@ -718,7 +733,8 @@ def _parse_klikindo_orders(text: str) -> OcrResult:
 
     result.tx_date = _date.today()
 
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    raw_lines = [l.strip() for l in text.splitlines() if l.strip()]
+    lines = _join_fragmented_lines(raw_lines)
     items = []
     i = 0
 
@@ -751,20 +767,27 @@ def _parse_klikindo_orders(text: str) -> OcrResult:
                     if re.match(r'^\d{6,}$', prev.strip()):
                         j -= 1
                         continue
-                    # Baris nama item — ada huruf dan bukan Rp/Total/Harga
+                    # Harga Satuan — sudah diambil, skip
+                    if re.match(r'^Harga\s+Satuan', prev, re.IGNORECASE):
+                        j -= 1
+                        continue
+                    # Baris nama item
                     if (re.search(r'[A-Za-z]', prev) and
-                        not re.match(r'^(Rp|Total|Harga|Beli|Beranda)', prev, re.IGNORECASE)):
-                        # Ambil qty dari "x1", "x2" dll
-                        qty_m = re.search(r'[xX](\d+)\s*$', prev)
+                        not re.match(r'^(Rp|Total|Harga|Beli|Beranda)', prev, re.IGNORECASE) and
+                        not re.match(r'^[xX]\d+\s*$', prev.strip()) and
+                        not re.match(r'^\d{1,2}$', prev.strip())):
+                        qty_m = re.search(r'[xX](\d+)', prev)
                         if qty_m:
                             qty = float(qty_m.group(1))
-                        # Bersihkan nama
-                        name_clean = re.sub(r'\s+[xX]\d+\s*$', '', prev).strip()
-                        name_clean = re.sub(r'\t.*', '', name_clean).strip()
-                        # Hapus "Brand • " prefix jika ada
-                        name_clean = re.sub(r'^[A-Za-z\s]+ • ', '', name_clean).strip()
-                        if len(name_clean) >= 3:
-                            name = name_clean
+                        nc = prev
+                        nc = re.sub(r'[\s\t]+\d{6,}.*$', '', nc)    # hapus SKU ter-join (tab/spasi)
+                        nc = re.sub(r'[\s\t]+[Mm][IiLlGg]\b', '', nc)  # hapus MI/Ml suffix
+                        nc = re.sub(r'\t.*', '', nc)                 # hapus setelah tab
+                        nc = re.sub(r'\s+[xX]\d+\s*$', '', nc)     # hapus qty di akhir
+                        nc = re.sub(r'^\S+\s*[\u2022\u00b7]\s*', '', nc)  # hapus "Brand • "
+                        nc = nc.strip()
+                        if len(nc) >= 3:
+                            name = nc
                         break
                     break
 

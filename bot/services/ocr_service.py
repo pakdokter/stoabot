@@ -672,9 +672,128 @@ def _normalize_ocr(text: str) -> str:
     return '\n'.join(lines_out)
 
 
+
+def _is_shopee_screenshot(text: str) -> bool:
+    """Deteksi apakah ini screenshot halaman pesanan Shopee/marketplace."""
+    indicators = [
+        r'\bpesanan\s+saya\b',
+        r'\bselesai\b.*\bbeli\s+lagi\b',
+        r'\bajukan\s+pengembalian\b',
+        r'\btotal\s+\d+\s+produk\b',
+        r'\bdikemas\b.*\bdikirim\b',
+    ]
+    text_lower = text.lower()
+    hits = sum(1 for p in indicators if re.search(p, text_lower))
+    return hits >= 2
+
+
+def _parse_shopee_orders(text: str) -> OcrResult:
+    """
+    Parse screenshot halaman Pesanan Saya Shopee.
+    Setiap order dipisahkan oleh baris 'NAMA TOKO\tSelesai'.
+    Output: satu OcrResult dengan semua order sebagai items,
+    total = jumlah semua order.
+    """
+    from datetime import date as _date
+    result = OcrResult(raw_text=text)
+    result.merchant = "Shopee"
+    result.tx_date = _date.today()
+
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+    # Deteksi batas setiap order
+    order_starts = []
+    for i, line in enumerate(lines):
+        if not re.search(r'\bSelesai\b|\bDikirim\b|\bDikemas\b', line):
+            continue
+        # Skip baris header tab
+        if re.search(r'Dikemas.*Dikirim|Dikirim.*Selesai', line):
+            continue
+        # Skip "Pesanan Saya"
+        if 'Pesanan Saya' in line:
+            continue
+        order_starts.append(i)
+
+    if not order_starts:
+        return result
+
+    items = []
+    total_all = 0.0
+
+    for idx, start in enumerate(order_starts):
+        end = order_starts[idx + 1] if idx + 1 < len(order_starts) else len(lines)
+        order_lines = lines[start:end]
+
+        if len(order_lines) < 2:
+            continue
+
+        # Nama toko: hapus "Mall | ORI", "Star+", "Selesai", "Dikirim"
+        toko_raw = order_lines[0]
+        toko = re.sub(r'Mall\s*\|\s*ORI\s*\t?', '', toko_raw)
+        toko = re.sub(r'Star\+\s*\t?', '', toko)
+        toko = re.sub(r'\t?(Selesai|Dikirim|Dikemas)\s*$', '', toko)
+        toko = re.sub(r'\t', ' ', toko).strip().strip('.')
+
+        # Total order: "Total N produk: RpXXX.XXX"
+        order_total = None
+        for l in order_lines:
+            m = re.search(r'Total\s+\d+\s+produk:\s*Rp\s*([\d.,]+)', l, re.IGNORECASE)
+            if m:
+                raw = m.group(1).replace('.', '').replace(',', '')
+                if raw.isdigit():
+                    order_total = float(raw)
+                break
+
+        if not order_total:
+            continue
+
+        # Nama produk: baris pertama setelah toko yang punya konten nama
+        produk_name = None
+        for l in order_lines[1:]:
+            # Skip baris harga, tombol, qty
+            if re.search(r'^Rp|Ajukan|Beli|Lihat|Total|\bx\d\b|\d+\s*kg\b', l, re.IGNORECASE):
+                continue
+            if len(l) >= 3 and not re.match(r'^[\d.,]+$', l):
+                # Hapus "..." di akhir, nama toko duplikat
+                clean = re.sub(r'\.{3}\s*$', '', l).strip()
+                clean = re.sub(r'\t.*', '', clean).strip()
+                if len(clean) >= 3:
+                    produk_name = clean
+                    break
+
+        name = f"{toko} — {produk_name}" if produk_name else toko
+        total_all += order_total
+
+        items.append(ReceiptItem(
+            name=name.upper()[:60],
+            qty=1.0,
+            unit="",
+            unit_price=order_total,
+            line_total=order_total,
+        ))
+
+    result.items = items
+    result.total = total_all if total_all > 0 else None
+    result.grand_total = result.total
+
+    score = 0.4 if result.items else 0.0
+    score += 0.3 if result.total else 0.0
+    score += 0.3  # merchant + date always set
+    result.confidence = round(score, 2)
+
+    return result
+
+
+
 def _parse_receipt_text(text: str) -> OcrResult:
     # Normalisasi dulu sebelum parsing
     text = _normalize_ocr(text)
+
+    # Deteksi format Shopee/marketplace lebih dulu
+    if _is_shopee_screenshot(text):
+        logger.info("[OCR] Shopee screenshot detected")
+        return _parse_shopee_orders(text)
+
     result = OcrResult(raw_text=text)
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     lines = _join_fragmented_lines(lines)

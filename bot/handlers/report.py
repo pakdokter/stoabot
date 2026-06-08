@@ -342,14 +342,16 @@ async def _generate_statement(update_or_query, context: ContextTypes.DEFAULT_TYP
         )
         saldo_awal = pre_summary["saldo"]
 
+    # Ambil nama user dulu sebelum generate PDF
+    from bot.database import AsyncSessionLocal as _ASL
+    from bot.models import User as _User
+    async with _ASL() as _s:
+        _u = await _s.get(_User, user_id)
+        user_name = _u.full_name if _u else str(user_id)
+
     try:
         pdf_bytes = generate_statement_pdf(txs, date_from, date_to, saldo_awal, user_name=user_name)
         filename = f"statement_{year}_{month:02d}.pdf"
-        from bot.database import AsyncSessionLocal as _ASL
-        from bot.models import User as _User
-        async with _ASL() as _s:
-            _u = await _s.get(_User, user_id)
-            user_name = _u.full_name if _u else str(user_id)
 
         await reply_target.reply_document(
             document=io.BytesIO(pdf_bytes),

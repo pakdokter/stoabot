@@ -44,6 +44,8 @@ TOTAL_KEYWORDS = [
     r'\bnetto\b', r'\bnet\b',
     r'\btotal\s+belanja\b', r'\bjumlah\s+belanja\b',
     r'\btotal\s+bayar\b', r'\btotal\s+pembayaran\b',
+    r'\btotal\s+incl\b', r'\btotal\s+include\b',
+    r'\btotal\s+termasuk\b', r'\bitem\(s\)\b',
     # OCR noise variants
     r'\brotal\b', r'\bt0tal\b', r'\bt\*tal\b', r'\btoial\b',
 ]
@@ -69,6 +71,8 @@ SAVINGS_KEYWORDS = [
     r'\bdpp\s*=\b', r'\bppn\s*=\b',
     r'\bpwp\b', r'\blp\s+\d\b',
     r'\btotal\s+qty\b', r'\bjml\s+item\b',
+    r'\bppn\s+included\b', r'\bitem\(s\)\b', r'\bqty\(s\)\b',
+    r'\bincluded\s+in\s+total\b',
 ]
 DISCOUNT_KEYWORDS = [
     r'\bdiskon\b', r'\bdiscount\b', r'\bdisc\b', r'\bkorting\b',
@@ -84,11 +88,19 @@ SKIP_LINE_PATTERNS = [
     r'\bterima kasih\b', r'\bjangan lupa\b', r'\bdatang kembali\b',
     r'\bpowered by\b', r'\bcopyright\b',
     r'^\s*[-=*_]{3,}\s*$',
-    r'\d{2}\.\d{2}\.\d{2}-\d{2}:\d{2}',  # timestamp: 06.26-08:52
-    r'\d+/\d+\.\d+\.\d+/',               # nomor struk: 4.2.1/T06C
-    r'\bpwp\s+\d{10,}\b',                  # PWP 0013379946092000
-    r'\blp\s+\d{6,}\b',                    # LP 1500280
-    r'\bswa\b', r'\bkontak@\b',             # footer Indomaret
+    r'\d{2}\.\d{2}\.\d{2}-\d{2}:\d{2}',
+    r'\d+/\d+\.\d+\.\d+/',
+    r'\bpwp\s+\d{10,}\b',
+    r'\blp\s+\d{6,}\b',
+    r'\bswa\b', r'\bkontak@\b',
+    r'\bnpwp\b',                              # NPWP header perusahaan
+    r'\boperator\s+id\b',                    # OPERATOR ID-XSEL
+    r'\bcustomer\s+care\b',                  # CUSTOMER CARE
+    r'\bpesan\s+whatsapp\b',                 # PESAN WHATSAPP
+    r'\bpenukaran\s+barang\b',               # footer MR DIY
+    r'\bwebsite\b', r'\bwww\.\b',          # WEBSITE
+    r'\byuk,\s+bantu\b',                     # footer
+    r'\bgedung\b', r'\bjalan\s+jenderal\b', # alamat HQ
 ]
 
 # Unit-unit umum di struk Indonesia
@@ -119,6 +131,11 @@ NON_ITEM_WORDS = {
     'ongkir', 'sampai', 'mudah', 'telp', 'wa', 'swf', 'pwp',
     'control', 'option', 'command',  # OCR noise dari UI elements
     'rga', 've', 'lp', 'men', 'maret', 'domaret', 'indomaret',
+    # Kota/wilayah
+    'jakarta', 'selatan', 'utara', 'barat', 'pusat', 'dki',
+    'surabaya', 'bandung', 'medan', 'makassar', 'denpasar',
+    'gedung', 'lantai', 'jenderal', 'sudirman', 'thamrin',
+    'npwp', 'invoice', 'pt', 'cv', 'tbk',
 }
 
 
@@ -172,13 +189,19 @@ def _is_item_name_line(line: str) -> bool:
     if len(line.strip()) < 2:
         return False
     # Skip baris yang dimulai dengan tanda baca/simbol DAN tidak punya huruf item
-    # Pengecualian: baris seperti ":TUNE MYK.GRG RF2L 43100 129,300" tetap valid
     stripped = line.strip()
     if re.match(r'^[^a-zA-Z0-9]', stripped):
-        # Cek apakah setelah tanda baca ada nama item (huruf kapital)
         after_punct = re.sub(r'^[^a-zA-Z0-9]+', '', stripped)
         if not re.search(r'[A-Z]{2,}', after_punct):
             return False
+
+    # Skip barcode — baris yang dimulai angka >= 8 digit
+    if re.match(r'^\d{8,}', stripped) and not re.search(r'[a-zA-Z]', stripped.split()[0] if stripped.split() else ''):
+        return False
+
+    # Skip kode produk — format "XXXX - YY/ZZZ" (kode item toko)
+    if re.match(r'^[A-Z]{2,}\d+\s*-\s*\d+', stripped):
+        return False
     if _matches_any(line, SKIP_LINE_PATTERNS):
         return False
     if _matches_any(line, TOTAL_KEYWORDS):
@@ -534,8 +557,13 @@ def _parse_receipt_text(text: str) -> OcrResult:
         'yogya': 'Yogya',
         'borma': 'Borma',
         'primo': 'Primo',
+        'mr d.i.y': 'MR D.I.Y.',
+        'mr diy': 'MR D.I.Y.',
+        'mrdiy': 'MR D.I.Y.',
         'primer raya': 'Primer Raya',
         'dinda frozen': 'Dinda Frozen Food',
+        'fadhilah frozen': 'Fadhilah Frozen Foods',
+        'fadhila frozen': 'Fadhilah Frozen Foods',
         'sb minimarket': 'SB Minimarket',
         'toko bahan kue': 'Toko Bahan Kue Amanah',
         'stoa space': 'Stoa Space',
@@ -574,13 +602,25 @@ def _parse_receipt_text(text: str) -> OcrResult:
         except Exception:
             pass
 
-    # Fallback: format DD/MM/YYYY
+    # Fallback: format DD/MM/YYYY atau DD-MM-YYYY
     if not result.tx_date:
-        for m in re.finditer(r'(\d{1,2})[\/\.](\d{1,2})[\/\.](\d{4})', text):
+        for m in re.finditer(r'(\d{1,2})[-\/\.](\d{1,2})[-\/\.](\d{4})', text):
             try:
                 from dateutil import parser as dp
                 result.tx_date = dp.parse(m.group(0), dayfirst=True).date()
                 break
+            except Exception:
+                pass
+
+    # Fallback 2: format DD-MM-YY (2 digit tahun seperti MR DIY: 05-06-26)
+    if not result.tx_date:
+        for m in re.finditer(r'\b(\d{2})-(\d{2})-(\d{2})\b', text):
+            try:
+                d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                if 1 <= d <= 31 and 1 <= mo <= 12:
+                    from datetime import date as _d
+                    result.tx_date = _d(2000 + y, mo, d)
+                    break
             except Exception:
                 pass
 

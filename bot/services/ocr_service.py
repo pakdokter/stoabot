@@ -425,6 +425,127 @@ def _parse_items_format_b(lines: list) -> list:
     return items
 
 
+
+def _parse_items_format_mrdiy(lines: list) -> list:
+    """
+    Parse format MR DIY / toko dengan SKU+barcode terpisah.
+
+    Pola per item:
+      NAMA ITEM [detail]        ← baris nama (huruf, mungkin ada volume/GSM)
+      SKU - XX/YY               ← kode SKU (baris opsional, diawali huruf+angka+dash)
+      BARCODE  QTY x  HARGA  TOTAL  ← barcode diikuti harga
+
+    Alternatif (item sudah ter-join):
+      NAMA ITEM  QTY x  HARGA  TOTAL  ← satu baris
+    """
+    def _is_sku_line(line):
+        """Kode SKU: CA615CA170 - 12/48, CB028 - 12/144"""
+        return bool(re.match(r'^[A-Z]{2,}\d+[A-Z0-9]*\s*-\s*\d', line.strip()))
+
+    def _is_barcode_price_line(line):
+        """Baris barcode + harga: 9840000770623  9,000  9,000"""
+        stripped = line.strip()
+        # Dimulai dengan angka panjang (barcode) diikuti harga
+        return bool(re.match(r'^\d{6,}', stripped)) and len(_extract_money(line)) >= 1
+
+    def _extract_item_price(line):
+        """Dari baris barcode+harga atau nama+harga, ambil qty dan harga."""
+        money = _extract_money(line)
+        if not money:
+            return None, None, None
+
+        # Cari pola "QTY x HARGA" atau "QTY X HARGA"
+        qty_match = re.search(r'(\d{1,3})\s*[xX]\s*(\d)', line)
+        if qty_match:
+            qty = float(qty_match.group(1))
+        else:
+            # Coba ambil angka kecil di awal setelah barcode
+            after_barcode = re.sub(r'^\d{6,}\s*', '', line.strip())
+            qty_m = re.match(r'^(\d{1,3})\s', after_barcode)
+            qty = float(qty_m.group(1)) if qty_m and int(qty_m.group(1)) <= 99 else 1.0
+
+        if len(money) >= 2:
+            unit_price = money[-2][0]
+            line_total = money[-1][0]
+        else:
+            unit_price = money[-1][0]
+            line_total = money[-1][0]
+
+        return qty, unit_price, line_total
+
+    items = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        has_alpha = bool(re.search(r'[A-Za-z]', line))
+        is_sku = _is_sku_line(line)
+        is_barcode = _is_barcode_price_line(line)
+        money = _extract_money(line)
+
+        # Pola: baris nama item (huruf, bukan SKU/barcode)
+        if has_alpha and not is_sku and not is_barcode and _is_item_name_line(line):
+            # Cek apakah ini item MR DIY: cari baris SKU atau barcode berikutnya
+            name_raw = line.strip()
+
+            # Hapus detail volume/GSM yang bukan nama: "1g X 60 CM 2000 GSM" dll
+            name_clean = re.sub(r'\b\d+[gG][Mm]?\b', '', name_raw)  # 2000 GSM
+            name_clean = re.sub(r'\s+[Xx]\s+\d+\s+[Cc][Mm]\b', '', name_clean)  # X 60 CM
+            name_clean = re.sub(r'\b\d+[Mm][Ll]\b', '', name_clean)  # 600ML
+            name_clean = re.sub(r'\t.*', '', name_clean)  # hapus setelah tab
+            name_clean = name_clean.strip().rstrip('-').strip()
+
+            # Cari baris price di depan (skip SKU jika ada)
+            j = i + 1
+            # Skip baris SKU
+            if j < len(lines) and _is_sku_line(lines[j]):
+                j += 1
+            # Cek baris barcode+harga
+            if j < len(lines) and _is_barcode_price_line(lines[j]):
+                qty, unit_price, line_total = _extract_item_price(lines[j])
+                if line_total and len(name_clean) >= 2:
+                    items.append(ReceiptItem(
+                        name=name_clean.upper(),
+                        qty=qty or 1.0,
+                        unit="",
+                        unit_price=unit_price or line_total,
+                        line_total=line_total,
+                    ))
+                i = j + 1
+                continue
+
+            # Cek apakah nama sudah punya harga di dalamnya (baris ter-join)
+            # Contoh: "MINI DUSTBIN #7749  1  21,500  8979504  21,500"
+            # Ambil angka yang bukan barcode (< 8 digit)
+            clean_money = [(v, p) for v, p in money if v < 10_000_000 and v >= 100]
+            if len(clean_money) >= 1 and not is_sku:
+                if len(clean_money) >= 2:
+                    line_total = clean_money[-1][0]
+                    unit_price = clean_money[-2][0]
+                else:
+                    line_total = clean_money[-1][0]
+                    unit_price = line_total
+
+                qty_m = re.search(r'\b(\d{1,2})\b', name_clean)
+                qty = float(qty_m.group(1)) if qty_m and int(qty_m.group(1)) <= 99 else 1.0
+
+                # Bersihkan angka dari nama
+                name_only = re.sub(r'\b\d+\b', '', name_clean).strip().rstrip('#').strip()
+                if len(name_only) >= 2:
+                    items.append(ReceiptItem(
+                        name=name_only.upper(),
+                        qty=1.0,
+                        unit="",
+                        unit_price=unit_price,
+                        line_total=line_total,
+                    ))
+                i += 1
+                continue
+
+        i += 1
+    return items
+
+
+
 def _classify_line(line: str) -> str:
     if _matches_any(line, SKIP_LINE_PATTERNS): return 'skip'
     if _matches_any(line, CHANGE_KEYWORDS): return 'change'
@@ -697,9 +818,10 @@ def _parse_receipt_text(text: str) -> OcrResult:
     # Coba Format A dulu (multi-line), lalu Format B (single-line)
     items_a = _parse_items_format_a(lines)
     items_b = _parse_items_format_b(lines)
+    items_mrdiy = _parse_items_format_mrdiy(lines)
 
-    # Pilih hasil terbaik: yang punya lebih banyak item valid
-    items = items_a if len(items_a) >= len(items_b) else items_b
+    # Pilih format dengan item terbanyak
+    items = max([items_a, items_b, items_mrdiy], key=lambda x: len(x))
 
     # Validasi: sum(line_total) harus mendekati total
     if items and result.total:

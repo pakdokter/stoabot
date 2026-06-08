@@ -101,6 +101,9 @@ SKIP_LINE_PATTERNS = [
     r'\bwebsite\b', r'\bwww\.\b',          # WEBSITE
     r'\byuk,\s+bantu\b',                     # footer
     r'\bgedung\b', r'\bjalan\s+jenderal\b', # alamat HQ
+    r'^\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}',  # timestamp MR DIY: 05-06-26 16:04
+    r'\bsenin\b.*\bjumat\b',               # jam operasional
+    r'\bkualitas\s+pelayanan\b',             # footer MR DIY
 ]
 
 # Unit-unit umum di struk Indonesia
@@ -150,13 +153,20 @@ def _extract_money(text: str) -> list:
     # Bersihkan noise: trailing -, =, karakter non-digit di ujung
     text_clean = re.sub(r'[-=]+$', '', text.strip())
     results = []
-    for m in re.finditer(r'\d{1,3}(?:[.,]\d{3})+|\d+', text_clean):
-        raw = m.group(0).replace('.', '').replace(',', '')
-        if raw.isdigit():
-            val = float(raw)
-            # Filter: minimal 100, maksimal 100 juta (harga belanja wajar)
-            if 100 <= val <= 100_000_000:
-                results.append((val, m.start()))
+    for m in re.finditer(r'\d{1,3}(?:[.,]\d{3})+|\d{1,3}[.,]\d{2}(?!\d)|\d+', text_clean):
+        raw_orig = m.group(0)
+        # Handle format ribuan: 43,500 / 43.500 / 43,50 (OCR potong digit)
+        raw = raw_orig.replace('.', '').replace(',', '')
+        if not raw.isdigit():
+            continue
+        val = float(raw)
+        # Jika hanya 4 digit dan asalnya ada koma/titik di posisi ribuan → kalikan 10
+        # Contoh: "43,50" → raw=4350 → tapi aslinya 43500
+        if len(raw) == 4 and re.match(r'^\d{2}[.,]\d{2}$', raw_orig):
+            val = val * 10  # 4350 → 43500
+        # Filter: minimal 100, maksimal 100 juta
+        if 100 <= val <= 100_000_000:
+            results.append((val, m.start()))
     return results  # list of (value, position)
 
 
@@ -188,7 +198,12 @@ def _is_item_name_line(line: str) -> bool:
         return False
     if len(line.strip()) < 2:
         return False
-    # Skip baris yang dimulai dengan tanda baca/simbol DAN tidak punya huruf item
+    # Skip baris yang hanya "Rp" / "RP" / "rp" (prefix mata uang tanpa nama item)
+    if re.match(r'^[Rr][Pp]\.?\s*[\d.,]*\s*$', line.strip()):
+        return False
+    # Skip baris yang hanya berisi satuan mata uang dan angka
+    if re.match(r'^[Rr][Pp]\s+[\d.,]+\s*$', line.strip()):
+        return False
     stripped = line.strip()
     if re.match(r'^[^a-zA-Z0-9]', stripped):
         after_punct = re.sub(r'^[^a-zA-Z0-9]+', '', stripped)
@@ -497,6 +512,7 @@ def _join_fragmented_lines(lines: list) -> list:
         has_financial_kw = any(_re.search(p, line.lower()) for p in [
             r'\btotal\b', r'\btunai\b', r'\bbayar\b', r'\bkembali\b',
             r'\bdiskon\b', r'\bsubtotal\b', r'\brotal\b', r'\brunai\b',
+            r'\bcash\b', r'\bchange\b', r'\bkredit\b', r'\bdebit\b',
         ])
         if has_financial_kw and not _has_money(line) and i + 1 < len(result):
             next_line = result[i + 1].strip()
@@ -524,10 +540,13 @@ def _normalize_ocr(text: str) -> str:
     # Bersihkan ":" atau spasi di awal baris item (OCR noise Indomaret)
     lines_out = []
     for line in result.splitlines():
-        # Hapus ":" di awal baris yang diikuti huruf kapital
         cleaned = re.sub(r'^[:\s]+(?=[A-Z])', '', line)
-        # Ganti tab ganda/multiple dengan satu tab
         cleaned = re.sub(r'\t+', '\t', cleaned)
+        # Normalisasi karakter OCR noise dalam angka
+        cleaned = cleaned.replace('€', '0')   # 43,50€ → 43,500
+        cleaned = cleaned.replace('к', 'R')   # кр → Rp (Cyrillic к)
+        cleaned = cleaned.replace('К', 'R')
+        cleaned = re.sub(r'(?<=[\d])O(?=[\d,.])', '0', cleaned)  # huruf O di antara angka
         lines_out.append(cleaned)
     return '\n'.join(lines_out)
 

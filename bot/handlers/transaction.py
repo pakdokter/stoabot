@@ -229,10 +229,13 @@ async def cmd_riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     from datetime import date as _date, timedelta
     from collections import defaultdict
+    from decimal import Decimal
+    from bot.services.balance import get_summary
+    import re as _re
 
     user_id = update.effective_user.id
     today = _date.today()
-    date_from = today - timedelta(days=6)  # 7 hari terakhir
+    date_from = today - timedelta(days=6)
 
     async with AsyncSessionLocal() as session:
         result = await session.execute(
@@ -243,39 +246,90 @@ async def cmd_riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 Transaction.transaction_date >= date_from,
                 Transaction.transaction_date <= today,
             )
-            .order_by(desc(Transaction.transaction_date), desc(Transaction.created_at))
+            .order_by(Transaction.transaction_date, Transaction.created_at)
         )
         txs = result.scalars().all()
+        saldo_awal_data = await get_summary(
+            session, user_id=user_id,
+            date_to=date_from - timedelta(days=1)
+        )
+        saldo_awal = saldo_awal_data["saldo"]
 
     if not txs:
         await update.message.reply_text(
             f"Belum ada transaksi dalam 7 hari terakhir\n"
-            f"({fmt_date(date_from)} — {fmt_date(today)})."
+            f"({fmt_date(date_from)} \u2014 {fmt_date(today)})."
         )
         return
+
+    db_user = context.user_data.get("db_user")
+    user_name = db_user.full_name if db_user else update.effective_user.first_name or "User"
 
     by_date = defaultdict(list)
     for tx in txs:
         by_date[tx.transaction_date].append(tx)
 
-    total_masuk = sum(tx.amount for tx in txs if tx.type == "masuk")
-    total_keluar = sum(tx.amount for tx in txs if tx.type == "keluar")
+    total_masuk = sum(Decimal(str(tx.amount)) for tx in txs if tx.type == "masuk")
+    total_keluar = sum(Decimal(str(tx.amount)) for tx in txs if tx.type == "keluar")
+    saldo_akhir = saldo_awal + total_masuk - total_keluar
+
+    def _parse_desc(desc):
+        if " \u2014 " in desc:
+            parts = desc.split(" \u2014 ", 1)
+            toko = parts[0].strip()
+            item_part = parts[1].strip()
+            qty_m = _re.search(r'\s+x(\d+)$|\s+\((\d+)x\)$', item_part)
+            if qty_m:
+                qty = int(qty_m.group(1) or qty_m.group(2))
+                item = item_part[:qty_m.start()].strip()
+            else:
+                qty = 1
+                item = item_part
+            return toko, item, qty
+        return desc.strip(), "", 1
+
+    SEP = "\u2501" * 20
 
     lines = [
-        f"📋 *Riwayat 7 Hari Terakhir*",
-        f"_{fmt_date(date_from)} — {fmt_date(today)}_\n",
-        f"Masuk: *{fmt_rupiah(total_masuk)}* | Keluar: *{fmt_rupiah(total_keluar)}*",
-        "─────────────────",
+        f"\U0001F4CB *Riwayat 7 Hari Terakhir*",
+        f"\U0001F464 {user_name}",
+        f"_{fmt_date(date_from)} \u2014 {fmt_date(today)}_",
+        f"",
+        f"Saldo Awal: *{fmt_rupiah(saldo_awal)}*",
+        SEP,
     ]
 
-    for d in sorted(by_date.keys(), reverse=True):
-        lines.append(f"\n*{fmt_date(d)}*")
-        for tx in by_date[d]:
-            sign = "+" if tx.type == "masuk" else "-"
-            lines.append(f"  {sign} {fmt_rupiah(tx.amount)}\n   _{tx.description}_")
+    for d in sorted(by_date.keys()):
+        day_txs = by_date[d]
+        lines.append(f"")
+        lines.append(f"\U0001F4C5 *{fmt_date(d)}*")
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        toko_groups = defaultdict(list)
+        for tx in day_txs:
+            toko, item, qty = _parse_desc(tx.description or "")
+            toko_groups[toko].append((tx, item, qty))
 
+        for toko, tx_list in toko_groups.items():
+            lines.append(f"\U0001F3EA _{toko}_")
+            for tx, item, qty in tx_list:
+                sign = "+" if tx.type == "masuk" else "-"
+                qty_str = f" x{qty}" if qty > 1 else ""
+                item_str = f" \u2014 {item}{qty_str}" if item else ""
+                lines.append(f"  {sign}{fmt_rupiah(tx.amount)}{item_str}")
+
+        lines.append(SEP)
+
+    lines += [
+        f"",
+        f"Saldo Akhir: *{fmt_rupiah(saldo_akhir)}*",
+        f"Masuk: {fmt_rupiah(total_masuk)} | Keluar: {fmt_rupiah(total_keluar)}",
+    ]
+
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3950] + "\n\n_...terpotong, gunakan /laporan untuk detail_"
+
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 # ──────────────────────────────────────────────
 # /cari

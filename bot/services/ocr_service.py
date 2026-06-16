@@ -901,14 +901,29 @@ def _parse_shopee_detail(text: str) -> OcrResult:
                     item_name = name
                     break
 
-        # Pola C: baris nama produk diikuti harga "Rp75.900" di baris berikutnya
-        # dan 2 baris kemudian ada "x1"
+        # Pola C: nama produk diikuti harga "Rp75.900" langsung (tanpa x1)
+        if i + 1 < len(lines):
+            next1 = lines[i+1].strip()
+            if re.match(r'^Rp[\d.,]+$', next1):
+                name = re.sub(r'\.{3}\s*$', '', line).strip()
+                if (len(name) >= 3 and
+                    not re.search(r'Rp|Total|Subtotal|Batalkan|Hubungi|stoa|sicepat|SiCepat|Alamat|stoaspace', name, re.IGNORECASE)):
+                    item_name = name
+                    # cek qty di baris berikutnya (opsional)
+                    if i + 2 < len(lines):
+                        next2 = lines[i+2].strip()
+                        qty_m = re.match(r'^x(\d+)$', next2, re.IGNORECASE)
+                        if qty_m:
+                            item_qty = int(qty_m.group(1))
+                    break
+
+        # Pola D: nama produk diikuti x1 lalu harga (3 baris)
         if i + 2 < len(lines):
             next1 = lines[i+1].strip()
             next2 = lines[i+2].strip()
-            if (re.match(r'^Rp[\d.,]+$', next1) and
-                re.match(r'^x\d+$', next2, re.IGNORECASE)):
-                qty_m = re.match(r'^x(\d+)$', next2, re.IGNORECASE)
+            if (re.match(r'^x\d+$', next1, re.IGNORECASE) and
+                re.match(r'^Rp[\d.,]+$', next2)):
+                qty_m = re.match(r'^x(\d+)$', next1, re.IGNORECASE)
                 if qty_m:
                     item_qty = int(qty_m.group(1))
                 name = re.sub(r'\.{3}\s*$', '', line).strip()

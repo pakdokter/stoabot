@@ -81,6 +81,9 @@ SAVINGS_KEYWORDS = [
     r'\bppn\s+dibebaskan\b', r'\bpkp\s+dibebaskan\b',
     r'\bharga\s+jual\b', r'\brga\s+jual\b',
     r'\bdpp\s*=', r'\bnpwp\b',
+    r'\btotal\s+disc\.?\b', r'\btotal\s+item\b',  # Alfamart total disc/item
+    r'\btotal\s+poin\b', r'\ba-poin\b',
+    r'\bcpm\s+qris\b',  # payment method bukan total
 ]
 DISCOUNT_KEYWORDS = [
     r'\bdiskon\b', r'\bdiscount\b', r'\bdisc\b', r'\bkorting\b',
@@ -112,6 +115,25 @@ SKIP_LINE_PATTERNS = [
     r'^\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}',  # timestamp MR DIY: 05-06-26 16:04
     r'\bsenin\b.*\bjumat\b',               # jam operasional
     r'\bkualitas\s+pelayanan\b',             # footer MR DIY
+    r'\ba-poin\b', r'\bpoin\s+anda\b',     # Alfamart poin
+    r'\bexpired\s+pada\b',                   # expired tanggal
+    r'\balfagift\b', r'\baltogift\b',        # Alfamart app
+    r'\bpotensi\s+poin\b',                   # poin info
+    r'\bkritik.*saran\b',                     # kritik saran
+    r'\bmember\s*:\s*[a-z*]+',               # MEMBER : BAIQ
+    r'\bstruk\s+anda\s+akan\b',             # struk dikirim
+    r'\bdikirim\s+ke\s+aplikasi\b',         # dikirim ke aplikasi
+    r'\bbon\s+[a-z0-9]',                      # Bon nomor struk
+    r'\btgl\.\s+\d',                         # Tgl. tanggal
+    r'\bv\.\.\.',                            # V...
+    r'\bcpm\s+qris\b',                       # CPM QRIS (payment method)
+    r'\bsms/wa\b',                            # SMS/WA
+    r'^-?(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|'
+    r'januari|februari|maret|april|mei|juni|juli|agustus|'
+    r'september|oktober|november|desember)-',  # "-Jun-2026"
+    r'^\d{1,2}-(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|'
+    r'januari|februari|maret|april|mei|juni|juli|agustus|'
+    r'september|oktober|november|desember)-\d{4}',  # "30-Jun-2026"
 ]
 
 # Unit-unit umum di struk Indonesia
@@ -147,6 +169,10 @@ NON_ITEM_WORDS = {
     'surabaya', 'bandung', 'medan', 'makassar', 'denpasar',
     'gedung', 'lantai', 'jenderal', 'sudirman', 'thamrin',
     'npwp', 'invoice', 'pt', 'cv', 'tbk',
+    # Alfamart/Indomaret footer
+    'poin', 'member', 'expired', 'alfagift', 'potensi',
+    'struk', 'dikirim', 'aplikasi', 'kritik', 'saran',
+    'bon', 'kasir', 'kembalian', 'disc',
 }
 
 
@@ -1440,7 +1466,26 @@ async def process_receipt(bot, file_id: str) -> OcrResult:
         image_bytes = bytes(await file.download_as_bytearray())
         logger.info(f"[OCR] size={len(image_bytes)} api={'custom' if api_key != 'helloworld' else 'demo'}")
 
-        async with httpx.AsyncClient(timeout=30) as client:
+        # Compress gambar jika lebih dari 500KB
+        if len(image_bytes) > 500_000:
+            try:
+                from PIL import Image
+                import io as _io
+                img = Image.open(_io.BytesIO(image_bytes))
+                # Resize jika terlalu besar
+                max_dim = 1800
+                if max(img.size) > max_dim:
+                    ratio = max_dim / max(img.size)
+                    new_size = (int(img.size[0]*ratio), int(img.size[1]*ratio))
+                    img = img.resize(new_size, Image.LANCZOS)
+                out = _io.BytesIO()
+                img.save(out, format='JPEG', quality=85)
+                image_bytes = out.getvalue()
+                logger.info(f"[OCR] compressed to {len(image_bytes)} bytes")
+            except Exception as ce:
+                logger.warning(f"[OCR] compress failed: {ce}")
+
+        async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
                 "https://api.ocr.space/parse/image",
                 data={"apikey": api_key, "language": "eng",

@@ -73,6 +73,25 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+async def handle_shopee_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, result: OcrResult):
+    """Tampilkan ringkasan Rincian Pesanan Shopee dan minta konfirmasi."""
+    from bot.utils.formatters import fmt_rupiah
+
+    msg = result.shopee_summary or "Terdeteksi belanja via Shopee"
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Ya, simpan", callback_data="ocr:ya"),
+        InlineKeyboardButton("✏️ Edit", callback_data="ocr:edit"),
+        InlineKeyboardButton("❌ Batal", callback_data="ocr:tidak"),
+    ]])
+
+    await update.message.reply_text(
+        f"{msg}\n\nSimpan sebagai pengeluaran?",
+        reply_markup=keyboard,
+    )
+    return OCR_KONFIRMASI
+
+
 async def handle_qris_result(update: Update, context: ContextTypes.DEFAULT_TYPE, result: OcrResult):
     """Tampilkan deteksi QRIS dan minta input manual merchant/item."""
     from bot.utils.formatters import fmt_rupiah, fmt_date

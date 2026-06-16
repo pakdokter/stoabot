@@ -58,6 +58,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
              items=len(result.items), confidence=result.confidence)
         context.user_data["ocr_result"] = result
         context.user_data["ocr_file_id"] = photo.file_id
+        # Shopee Rincian Pesanan → tampilkan summary langsung
+        if result.is_shopee_detail:
+            return await handle_shopee_detail(update, context, result)
         # QRIS → form input manual
         if result.is_qris:
             return await handle_qris_result(update, context, result)

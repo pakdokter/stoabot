@@ -20,11 +20,15 @@ from bot.services.audit import log_create
 from bot.utils.formatters import fmt_rupiah, fmt_date, parse_amount
 from bot.handlers.auth import ensure_registered
 
-OCR_KONFIRMASI   = 50
-OCR_EDIT_NOMINAL = 51
-OCR_EDIT_MENU    = 52
+OCR_KONFIRMASI    = 50
+OCR_EDIT_NOMINAL  = 51
+OCR_EDIT_MENU     = 52
 OCR_EDIT_MERCHANT = 53
-OCR_EDIT_DATE    = 54
+OCR_EDIT_DATE     = 54
+OCR_QRIS_MERCHANT = 55
+OCR_QRIS_ITEM     = 56
+OCR_QRIS_QTY      = 57
+OCR_QRIS_TOTAL    = 58
 
 
 def _log(user_id, state, action, **kwargs):
@@ -54,12 +58,153 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
              items=len(result.items), confidence=result.confidence)
         context.user_data["ocr_result"] = result
         context.user_data["ocr_file_id"] = photo.file_id
+        # QRIS → form input manual
+        if result.is_qris:
+            return await handle_qris_result(update, context, result)
         return await _show_ocr_result(update, result)
     except Exception as e:
         logger.exception(f"[OCR] uid={user_id} failed: {e}")
         await update.message.reply_text("❌ Gagal membaca struk.\nInput manual: /keluar")
         context.user_data.clear()
         return ConversationHandler.END
+
+
+
+async def handle_qris_result(update: Update, context: ContextTypes.DEFAULT_TYPE, result: OcrResult):
+    """Tampilkan deteksi QRIS dan minta input manual merchant/item."""
+    from bot.utils.formatters import fmt_rupiah, fmt_date
+
+    merchant = result.merchant or "tidak terdeteksi"
+    total_str = fmt_rupiah(result.total) if result.total else "belum terdeteksi"
+    date_str = fmt_date(result.tx_date) if result.tx_date else "hari ini"
+
+    await update.message.reply_text(
+        f"💳 *Terdeteksi: Bukti Pembayaran QRIS*\n\n"
+        f"Merchant: *{_esc(merchant)}*\n"
+        f"Total: *{total_str}*\n"
+        f"Tanggal: *{date_str}*\n\n"
+        f"Lengkapi data belanja:\n"
+        f"Ketik *nama toko/merchant* yang benar:",
+        parse_mode="Markdown",
+    )
+    return OCR_QRIS_MERCHANT
+
+
+async def qris_input_merchant(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Input nama merchant QRIS."""
+    text = update.message.text.strip()
+    if len(text) < 2:
+        await update.message.reply_text("❌ Nama terlalu pendek.")
+        return OCR_QRIS_MERCHANT
+    context.user_data["qris_merchant"] = text
+    await update.message.reply_text(
+        f"🏪 Merchant: *{_esc(text)}*\n\n"
+        f"Ketik *nama item* yang dibeli:\n_(tulis singkat, contoh: Kopi Ethiopia, Matcha Latte)_",
+        parse_mode="Markdown",
+    )
+    return OCR_QRIS_ITEM
+
+
+async def qris_input_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Input nama item QRIS."""
+    text = update.message.text.strip()
+    if len(text) < 2:
+        await update.message.reply_text("❌ Nama item tidak valid.")
+        return OCR_QRIS_ITEM
+    context.user_data["qris_item"] = text
+    await update.message.reply_text(
+        f"📦 Item: *{_esc(text)}*\n\nJumlah (qty)?\n_(ketik angka, misal: 1)_",
+        parse_mode="Markdown",
+    )
+    return OCR_QRIS_QTY
+
+
+async def qris_input_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Input qty QRIS."""
+    text = update.message.text.strip()
+    try:
+        qty = int(text)
+        if qty < 1:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Qty tidak valid. Ketik angka, misal: 1")
+        return OCR_QRIS_QTY
+    context.user_data["qris_qty"] = qty
+
+    result: OcrResult = context.user_data.get("ocr_result")
+    total_hint = f"\n_(Terdeteksi: {fmt_rupiah(result.total)})_" if result and result.total else ""
+    await update.message.reply_text(
+        f"🔢 Qty: *{qty}*\n\nHarga total?{total_hint}\n_(atau ketik `sama` untuk pakai yang terdeteksi)_",
+        parse_mode="Markdown",
+    )
+    return OCR_QRIS_TOTAL
+
+
+async def qris_input_total(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Input total QRIS dan simpan."""
+    from bot.utils.formatters import parse_amount, fmt_rupiah, fmt_date
+    text = update.message.text.strip().lower()
+    user_id = update.effective_user.id
+
+    result: OcrResult = context.user_data.get("ocr_result")
+
+    if text in ("sama", "s", "y", "ya"):
+        amount = result.total if result else 0
+    else:
+        amount = parse_amount(text)
+
+    if not amount or amount <= 0:
+        await update.message.reply_text("❌ Nominal tidak valid.")
+        return OCR_QRIS_TOTAL
+
+    merchant = context.user_data.get("qris_merchant", "QRIS")
+    item = context.user_data.get("qris_item", "Belanja")
+    qty = context.user_data.get("qris_qty", 1)
+    tx_date = result.tx_date if result else date.today()
+    qty_str = f" x{qty}" if qty > 1 else ""
+    description = f"{merchant} — {item}{qty_str}"
+
+    try:
+        async with AsyncSessionLocal() as session:
+            tx = Transaction(
+                user_id=user_id, type="keluar", amount=amount,
+                description=description, transaction_date=tx_date,
+            )
+            session.add(tx)
+            await session.flush()
+            await log_create(session, user_id, tx)
+            await session.commit()
+
+        async with AsyncSessionLocal() as session2:
+            saldo = await get_running_balance(session2, user_id=user_id)
+
+        db_user = context.user_data.get("db_user")
+        user_name = db_user.full_name if db_user else str(user_id)
+        await sheets_append(
+            user_id=user_id, user_name=user_name,
+            tx_type="keluar", amount=amount,
+            description=description, tx_date=tx_date,
+            source="qris",
+        )
+
+        await update.message.reply_text(
+            f"✅ *Transaksi QRIS berhasil disimpan*\n\n"
+            f"Merchant: {_esc(merchant)}\n"
+            f"Item: {_esc(item)}{qty_str}\n"
+            f"Total: *{fmt_rupiah(amount)}*\n"
+            f"Tanggal: {fmt_date(tx_date)}\n\n"
+            f"💰 Saldo saat ini:\n*{fmt_rupiah(saldo)}*",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.error(f"[QRIS] save failed: {e}")
+        await update.message.reply_text(f"❌ Gagal menyimpan.\n`{e}`", parse_mode="Markdown")
+
+    _p = {k: context.user_data[k] for k in ("session_verified","db_user") if k in context.user_data}
+    context.user_data.clear()
+    context.user_data.update(_p)
+    return ConversationHandler.END
+
 
 
 async def _show_ocr_result(update: Update, result: OcrResult):
@@ -476,6 +621,18 @@ def build_ocr_conv() -> ConversationHandler:
             OCR_EDIT_DATE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ocr_edit_date),
                 MessageHandler(filters.PHOTO, handle_photo),
+            ],
+            OCR_QRIS_MERCHANT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, qris_input_merchant),
+            ],
+            OCR_QRIS_ITEM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, qris_input_item),
+            ],
+            OCR_QRIS_QTY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, qris_input_qty),
+            ],
+            OCR_QRIS_TOTAL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, qris_input_total),
             ],
         },
         fallbacks=[],

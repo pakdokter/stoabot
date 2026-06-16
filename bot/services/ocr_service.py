@@ -756,9 +756,9 @@ def _parse_klikindo_orders(text: str) -> OcrResult:
     dikirim_m = re.search(r'Dikirim\s+ke\s*:\s*([A-Z][A-Z\s]+?)(?:\t|\n|$)', text)
     if dikirim_m:
         dest = dikirim_m.group(1).strip().title()
-        result.merchant = f"Sukanda ({dest})"
+        result.merchant = "Sukanda Jaya" 
     elif re.search(r'klikindomaret', text, re.IGNORECASE):
-        result.merchant = "Klikindomaret"
+        result.merchant = "Indomaret"
     elif re.search(r'tokopedia', text, re.IGNORECASE):
         result.merchant = "Tokopedia"
     else:
@@ -1287,7 +1287,9 @@ def _parse_receipt_text(text: str) -> OcrResult:
     # ── Merchant ──
     # Deteksi nama toko terkenal dari seluruh teks
     KNOWN_MERCHANTS = {
+        # Minimarket
         'indomaret': 'Indomaret',
+        'klikindomaret': 'Indomaret',
         'alfamart': 'Alfamart',
         'alfamidi': 'Alfamidi',
         'lawson': 'Lawson',
@@ -1302,15 +1304,16 @@ def _parse_receipt_text(text: str) -> OcrResult:
         'yogya': 'Yogya',
         'borma': 'Borma',
         'primo': 'Primo',
+        # Toko lokal Selong
         'mr d.i.y': 'MR D.I.Y.',
         'mr diy': 'MR D.I.Y.',
         'mrdiy': 'MR D.I.Y.',
         'primer raya': 'Primer Raya',
         'dinda frozen': 'Dinda Frozen Food',
-        'fadhilah frozen': 'Fadhilah Frozen Foods',
-        'fadhila frozen': 'Fadhilah Frozen Foods',
-        'sb minimarket': 'SB Minimarket',
-        'toko bahan kue': 'Toko Bahan Kue Amanah',
+        'fadhilah frozen': 'Fadhilah',
+        'fadhila frozen': 'Fadhilah',
+        'sb minimarket': 'Sinar Bahagia',
+        'toko bahan kue': 'Amanah',
         'stoa space': 'Stoa Space',
     }
 

@@ -878,26 +878,42 @@ def _parse_shopee_detail(text: str) -> OcrResult:
     item_name = None
     item_qty = 1
     for i, line in enumerate(lines):
-        # Pola: nama item lalu "x1" di baris yang sama atau berikutnya
-        qty_inline = re.search(r'x(\d+)\s*$', line)
+        # Pola A: nama item lalu "x1" di baris yang sama
+        qty_inline = re.search(r'\bx(\d+)\s*$', line, re.IGNORECASE)
         if qty_inline:
             item_qty = int(qty_inline.group(1))
-            name = re.sub(r'\s*x\d+\s*$', '', line).strip()
-            # Bersihkan "..." di akhir
+            name = re.sub(r'\s*\bx\d+\s*$', '', line, flags=re.IGNORECASE).strip()
             name = re.sub(r'\.{3}\s*$', '', name).strip()
-            if len(name) >= 3 and not re.search(r'Rp|Total|Subtotal', name):
+            if len(name) >= 3 and not re.search(r'Rp|Total|Subtotal|Batalkan|Hubungi|SiCepat', name, re.IGNORECASE):
                 item_name = name
                 break
 
-        # Pola: baris nama item, baris berikutnya "x1"
+        # Pola B: baris nama item, baris berikutnya "x1" sendirian
         if i + 1 < len(lines):
             next_line = lines[i+1].strip()
-            if re.match(r'^x(\d+)$', next_line):
-                qty_m = re.match(r'^x(\d+)$', next_line)
-                item_qty = int(qty_m.group(1))
+            if re.match(r'^x\d+$', next_line, re.IGNORECASE):
+                qty_m = re.match(r'^x(\d+)$', next_line, re.IGNORECASE)
+                if qty_m:
+                    item_qty = int(qty_m.group(1))
                 name = re.sub(r'\.{3}\s*$', '', line).strip()
                 if (len(name) >= 3 and
                     not re.search(r'Rp|Total|Subtotal|Batalkan|Hubungi|stoa|space|sicepat', name, re.IGNORECASE)):
+                    item_name = name
+                    break
+
+        # Pola C: baris nama produk diikuti harga "Rp75.900" di baris berikutnya
+        # dan 2 baris kemudian ada "x1"
+        if i + 2 < len(lines):
+            next1 = lines[i+1].strip()
+            next2 = lines[i+2].strip()
+            if (re.match(r'^Rp[\d.,]+$', next1) and
+                re.match(r'^x\d+$', next2, re.IGNORECASE)):
+                qty_m = re.match(r'^x(\d+)$', next2, re.IGNORECASE)
+                if qty_m:
+                    item_qty = int(qty_m.group(1))
+                name = re.sub(r'\.{3}\s*$', '', line).strip()
+                if (len(name) >= 3 and
+                    not re.search(r'Rp|Total|Subtotal|Batalkan|Hubungi|stoa|sicepat', name, re.IGNORECASE)):
                     item_name = name
                     break
 

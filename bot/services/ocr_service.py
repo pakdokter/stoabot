@@ -35,6 +35,10 @@ class OcrResult:
     confidence: float = 0.0
     provider: str = "ocrspace"
     is_qris: bool = False
+    is_shopee_detail: bool = False
+    shopee_summary: str = ""
+    shopee_item: str = ""
+    shopee_qty: int = 1
 
 
 # ── Keyword lists ──────────────────────────────────────────────────────
@@ -817,6 +821,118 @@ def _parse_klikindo_orders(text: str) -> OcrResult:
 
 
 
+
+def _is_shopee_detail(text: str) -> bool:
+    """Deteksi halaman Rincian Pesanan Shopee (per order detail)."""
+    indicators = [
+        r'rincian\s+pesanan',
+        r'subtotal\s+produk',
+        r'total\s+pesanan',
+        r'batalkan\s+pesanan',
+        r'hubungi\s+penjual',
+        r'subtotal\s+pengiriman',
+        r'voucher\s+shopee',
+        r'biaya\s+layanan',
+    ]
+    text_lower = text.lower()
+    hits = sum(1 for p in indicators if re.search(p, text_lower))
+    return hits >= 3
+
+
+def _parse_shopee_detail(text: str) -> OcrResult:
+    """
+    Parse halaman Rincian Pesanan Shopee.
+    Ekstrak: merchant, item, qty, total pesanan.
+    Output ringkas: "Terdeteksi belanja via Shopee..."
+    """
+    from datetime import date as _date
+    result = OcrResult(raw_text=text)
+    result.tx_date = _date.today()
+    from bot.utils.formatters import fmt_rupiah
+    result.merchant = "Shopee"
+    result.is_shopee_detail = True
+
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+    # Merchant: baris setelah "Star+" atau standalone merchant name
+    merchant = None
+    for i, line in enumerate(lines):
+        if re.search(r'Star\+|Mall\s*\|', line):
+            # Merchant ada di baris yang sama atau berikutnya
+            clean = re.sub(r'Star\+\s*', '', line).strip()
+            clean = re.sub(r'Mall\s*\|\s*', '', clean).strip()
+            if len(clean) >= 2:
+                merchant = clean
+                break
+        # Baris yang terlihat seperti nama toko (bukan keyword)
+        if (re.search(r'[A-Z][a-z]', line) and
+            not re.search(r'Rp|Total|Subtotal|Voucher|Biaya|Batalkan|Hubungi|Alamat|Pengiriman|SiCepat|stoa', line, re.IGNORECASE) and
+            not re.match(r'^\d', line) and
+            len(line) < 30 and i < 15):
+            if not merchant:
+                merchant = line
+
+    result.merchant = merchant or "Shopee"
+
+    # Item: baris yang berisi nama produk (sebelum "x1", "x2" dll)
+    item_name = None
+    item_qty = 1
+    for i, line in enumerate(lines):
+        # Pola: nama item lalu "x1" di baris yang sama atau berikutnya
+        qty_inline = re.search(r'x(\d+)\s*$', line)
+        if qty_inline:
+            item_qty = int(qty_inline.group(1))
+            name = re.sub(r'\s*x\d+\s*$', '', line).strip()
+            # Bersihkan "..." di akhir
+            name = re.sub(r'\.{3}\s*$', '', name).strip()
+            if len(name) >= 3 and not re.search(r'Rp|Total|Subtotal', name):
+                item_name = name
+                break
+
+        # Pola: baris nama item, baris berikutnya "x1"
+        if i + 1 < len(lines):
+            next_line = lines[i+1].strip()
+            if re.match(r'^x(\d+)$', next_line):
+                qty_m = re.match(r'^x(\d+)$', next_line)
+                item_qty = int(qty_m.group(1))
+                name = re.sub(r'\.{3}\s*$', '', line).strip()
+                if (len(name) >= 3 and
+                    not re.search(r'Rp|Total|Subtotal|Batalkan|Hubungi|stoa|space|sicepat', name, re.IGNORECASE)):
+                    item_name = name
+                    break
+
+    # Total Pesanan: "Total Pesanan: Rp80.910"
+    total_m = re.search(r'Total\s+Pesanan\s*:\s*Rp([\d.,]+)', text, re.IGNORECASE)
+    if total_m:
+        raw = total_m.group(1).replace('.', '').replace(',', '')
+        if raw.isdigit():
+            result.total = float(raw)
+
+    # Buat summary text yang akan ditampilkan ke user
+    summary_parts = [f"Terdeteksi belanja via Shopee"]
+    if merchant:
+        summary_parts.append(f"Nama Merchant: {merchant}")
+    if item_name:
+        summary_parts.append(f"Item: {item_name}")
+    summary_parts.append(f"Qty: {item_qty}")
+    if result.total:
+        summary_parts.append(f"Total: {fmt_rupiah(result.total)}")
+
+    result.shopee_summary = "\n".join(summary_parts)
+    result.shopee_item = item_name or "Item Shopee"
+    result.shopee_qty = item_qty
+
+    score = 0.3
+    score += 0.3 if result.total else 0.0
+    score += 0.2 if item_name else 0.0
+    score += 0.2 if merchant else 0.0
+    result.confidence = round(score, 2)
+
+    logger.info(f"[OCR] Shopee detail: merchant={merchant!r} item={item_name!r} qty={item_qty} total={result.total}")
+    return result
+
+
+
 def _is_qris_receipt(text: str) -> bool:
     """Deteksi bukti pembayaran QRIS dari bank (BCA, Mandiri, BRI, dll)."""
     indicators = [
@@ -1007,6 +1123,10 @@ def _parse_receipt_text(text: str) -> OcrResult:
     text = _normalize_ocr(text)
 
     # Deteksi format marketplace/app lebih dulu
+    if _is_shopee_detail(text):
+        logger.info("[OCR] Shopee detail order detected")
+        return _parse_shopee_detail(text)
+
     if _is_qris_receipt(text):
         logger.info("[OCR] QRIS payment receipt detected")
         return _parse_qris_receipt(text)

@@ -79,13 +79,12 @@ async def handle_qris_result(update: Update, context: ContextTypes.DEFAULT_TYPE,
     date_str = fmt_date(result.tx_date) if result.tx_date else "hari ini"
 
     await update.message.reply_text(
-        f"💳 *Terdeteksi: Bukti Pembayaran QRIS*\n\n"
-        f"Merchant: *{_esc(merchant)}*\n"
-        f"Total: *{total_str}*\n"
-        f"Tanggal: *{date_str}*\n\n"
+        f"💳 Terdeteksi: Bukti Pembayaran QRIS\n\n"
+        f"Merchant: {merchant}\n"
+        f"Total: {total_str}\n"
+        f"Tanggal: {date_str}\n\n"
         f"Lengkapi data belanja:\n"
-        f"Ketik *nama toko/merchant* yang benar:",
-        parse_mode="Markdown",
+        f"Ketik nama toko/merchant yang benar:",
     )
     return OCR_QRIS_MERCHANT
 
@@ -98,9 +97,8 @@ async def qris_input_merchant(update: Update, context: ContextTypes.DEFAULT_TYPE
         return OCR_QRIS_MERCHANT
     context.user_data["qris_merchant"] = text
     await update.message.reply_text(
-        f"🏪 Merchant: *{_esc(text)}*\n\n"
-        f"Ketik *nama item* yang dibeli:\n_(tulis singkat, contoh: Kopi Ethiopia, Matcha Latte)_",
-        parse_mode="Markdown",
+        f"🏪 Merchant: {text}\n\n"
+        f"Ketik nama item yang dibeli:\n(tulis singkat, contoh: Kopi Ethiopia, Matcha Latte)",
     )
     return OCR_QRIS_ITEM
 
@@ -113,8 +111,7 @@ async def qris_input_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return OCR_QRIS_ITEM
     context.user_data["qris_item"] = text
     await update.message.reply_text(
-        f"📦 Item: *{_esc(text)}*\n\nJumlah (qty)?\n_(ketik angka, misal: 1)_",
-        parse_mode="Markdown",
+        f"📦 Item: {text}\n\nJumlah (qty)?\n(ketik angka, misal: 1)",
     )
     return OCR_QRIS_QTY
 
@@ -132,10 +129,9 @@ async def qris_input_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["qris_qty"] = qty
 
     result: OcrResult = context.user_data.get("ocr_result")
-    total_hint = f"\n_(Terdeteksi: {fmt_rupiah(result.total)})_" if result and result.total else ""
+    total_hint = f"\n(Terdeteksi: {fmt_rupiah(result.total)})" if result and result.total else ""
     await update.message.reply_text(
-        f"🔢 Qty: *{qty}*\n\nHarga total?{total_hint}\n_(atau ketik `sama` untuk pakai yang terdeteksi)_",
-        parse_mode="Markdown",
+        f"🔢 Qty: {qty}\n\nHarga total?{total_hint}\n(atau ketik 'sama' untuk pakai yang terdeteksi)",
     )
     return OCR_QRIS_TOTAL
 
@@ -188,13 +184,12 @@ async def qris_input_total(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         await update.message.reply_text(
-            f"✅ *Transaksi QRIS berhasil disimpan*\n\n"
-            f"Merchant: {_esc(merchant)}\n"
-            f"Item: {_esc(item)}{qty_str}\n"
-            f"Total: *{fmt_rupiah(amount)}*\n"
+            f"✅ Transaksi QRIS berhasil disimpan\n\n"
+            f"Merchant: {merchant}\n"
+            f"Item: {item}{qty_str}\n"
+            f"Total: {fmt_rupiah(amount)}\n"
             f"Tanggal: {fmt_date(tx_date)}\n\n"
-            f"💰 Saldo saat ini:\n*{fmt_rupiah(saldo)}*",
-            parse_mode="Markdown",
+            f"💰 Saldo saat ini: {fmt_rupiah(saldo)}",
         )
     except Exception as e:
         logger.error(f"[QRIS] save failed: {e}")

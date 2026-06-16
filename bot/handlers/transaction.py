@@ -354,7 +354,7 @@ async def cmd_cari(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 Transaction.user_id == user_id,
                 Transaction.description.ilike(f"%{keyword}%")
             )
-            .order_by(desc(Transaction.transaction_date))
+            .order_by(Transaction.transaction_date, Transaction.created_at)
             .limit(20)
         )
         txs = result.scalars().all()

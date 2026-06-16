@@ -906,14 +906,26 @@ def _parse_shopee_detail(text: str) -> OcrResult:
             i += 1
             continue
 
-        # Bersihkan prefix noise (Pi.-\t, DELIFRU\t, nomor, bullet)
-        name_raw = re.sub(r'^[A-Za-z]{2,6}\s*[-\.]+\s*\t+', '', line)  # "Pi.-\t" "DELIFRU.-\t"
-        name_raw = re.sub(r'^[A-Z]{2,8}\t', '', name_raw)               # "DELIFRU\t"
-        name_raw = re.sub(r'^\d+\.\s*', '', name_raw)                   # "1. "
-        name_raw = re.sub(r'^[•·\-]+\s*', '', name_raw)                 # bullet
-        name_raw = re.sub(r'\t.*$', '', name_raw)                       # hapus tab dan sisa
-        name_raw = re.sub(r'\s*\.{3}\s*$', '', name_raw).strip()        # hapus "..."
-        name_raw = re.sub(r'[…]+\s*$', '', name_raw).strip()            # hapus "…"
+        # Ekstrak nama — jika ada tab, ambil bagian terpanjang yang bukan harga/keyword
+        # Contoh: "MSH MASTER\tPembersih Mesin Kopi Coffee Clean P..." → ambil nama produk
+        if '\t' in line:
+            parts = [p.strip() for p in line.split('\t') if p.strip()]
+            valid = [p for p in parts
+                     if len(p) >= 4
+                     and not re.match(r'^Rp', p)
+                     and not SKIP_KEYWORDS.search(p)
+                     and not re.match(r'^[xX]\d+$', p)]
+            name_raw = max(valid, key=len) if valid else parts[0]
+        else:
+            name_raw = line
+
+        # Bersihkan prefix noise
+        name_raw = re.sub(r'^[A-Za-z]{2,6}\s*[-\.]+\s*', '', name_raw)  # "Pi.-"
+        name_raw = re.sub(r'^\d+\.\s*', '', name_raw)                    # "1. "
+        name_raw = re.sub(r'^[•·\-]+\s*', '', name_raw)                  # bullet
+        name_raw = re.sub(r'\t.*$', '', name_raw)                        # hapus sisa tab
+        name_raw = re.sub(r'\s*\.{3}\s*$', '', name_raw).strip()         # hapus "..."
+        name_raw = re.sub(r'[…]+\s*$', '', name_raw).strip()             # hapus "…"
 
         # Skip jika nama terlalu pendek atau masih keyword
         if len(name_raw) < 4 or SKIP_KEYWORDS.search(name_raw):

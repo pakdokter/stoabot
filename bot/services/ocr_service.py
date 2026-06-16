@@ -842,124 +842,194 @@ def _is_shopee_detail(text: str) -> bool:
 def _parse_shopee_detail(text: str) -> OcrResult:
     """
     Parse halaman Rincian Pesanan Shopee.
-    Ekstrak: merchant, item, qty, total pesanan.
-    Output ringkas: "Terdeteksi belanja via Shopee..."
+
+    Struktur output:
+    - Setiap item produk → ReceiptItem tersendiri
+    - Biaya layanan + ongkir → satu ReceiptItem terpisah di akhir
+    - Total pesanan = total semua item + biaya layanan + ongkir
     """
     from datetime import date as _date
+    from bot.utils.formatters import fmt_rupiah
     result = OcrResult(raw_text=text)
     result.tx_date = _date.today()
-    from bot.utils.formatters import fmt_rupiah
     result.merchant = "Shopee"
     result.is_shopee_detail = True
 
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-    # Merchant: baris setelah "Star+" atau standalone merchant name
+    # ── Merchant ──
     merchant = None
     for i, line in enumerate(lines):
+        # "Star+\tGranology" atau "Mall | ORI\tBubuqu Official Store"
         if re.search(r'Star\+|Mall\s*\|', line):
-            # Merchant ada di baris yang sama atau berikutnya
-            clean = re.sub(r'Star\+\s*', '', line).strip()
-            clean = re.sub(r'Mall\s*\|\s*', '', clean).strip()
+            clean = re.sub(r'(Star\+|Mall\s*\|\s*ORI)\s*\t?\s*', '', line).strip()
+            clean = re.sub(r'\t.*', '', clean).strip()
             if len(clean) >= 2:
                 merchant = clean
                 break
-        # Baris yang terlihat seperti nama toko (bukan keyword)
-        if (re.search(r'[A-Z][a-z]', line) and
-            not re.search(r'Rp|Total|Subtotal|Voucher|Biaya|Batalkan|Hubungi|Alamat|Pengiriman|SiCepat|stoa', line, re.IGNORECASE) and
-            not re.match(r'^\d', line) and
-            len(line) < 30 and i < 15):
-            if not merchant:
-                merchant = line
 
     result.merchant = merchant or "Shopee"
 
-    # Item: baris yang berisi nama produk (sebelum "x1", "x2" dll)
-    item_name = None
-    item_qty = 1
-    for i, line in enumerate(lines):
-        # Pola A: nama item lalu "x1" di baris yang sama
-        qty_inline = re.search(r'\bx(\d+)\s*$', line, re.IGNORECASE)
-        if qty_inline:
-            item_qty = int(qty_inline.group(1))
-            name = re.sub(r'\s*\bx\d+\s*$', '', line, flags=re.IGNORECASE).strip()
-            name = re.sub(r'\.{3}\s*$', '', name).strip()
-            if len(name) >= 3 and not re.search(r'Rp|Total|Subtotal|Batalkan|Hubungi|SiCepat', name, re.IGNORECASE):
-                item_name = name
+    # ── Item produk ──
+    # Pola: nama item (mengandung huruf, bukan keyword)
+    # diikuti "x1" (bisa inline atau baris berikutnya)
+    # diikuti harga "Rp127.500 Rp78.990" (harga coret + harga asli)
+    SKIP_KEYWORDS = re.compile(
+        r'Subtotal|Total|Batalkan|Hubungi|Voucher|Biaya|Diskon|'
+        r'Gratis|SiCepat|Alamat|Pengiriman|stoa|Butuh|Layanan|'
+        r'Rincian|Pesanan|varlan|Random|Varian',
+        re.IGNORECASE
+    )
+
+    items = []
+    merchant_line_idx = 0
+    for idx, line in enumerate(lines):
+        if merchant and len(merchant) > 3 and merchant.lower() in line.lower():
+            merchant_line_idx = idx + 1
+            break
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # Skip baris yang jelas bukan item (bukan berdasarkan posisi)
+        if SKIP_KEYWORDS.search(line):
+            i += 1
+            continue
+        if re.match(r'^Rp', line) or re.match(r'^\d{1,2}[:.]', line):
+            i += 1
+            continue
+        if not re.search(r'[A-Za-z]{3,}', line):
+            i += 1
+            continue
+        # Skip baris yang mengandung nama merchant
+        if merchant and len(merchant) > 3 and merchant.lower() in line.lower():
+            i += 1
+            continue
+
+        # Bersihkan prefix noise (Pi.-\t, DELIFRU\t, nomor, bullet)
+        name_raw = re.sub(r'^[A-Za-z]{2,6}\s*[-\.]+\s*\t+', '', line)  # "Pi.-\t" "DELIFRU.-\t"
+        name_raw = re.sub(r'^[A-Z]{2,8}\t', '', name_raw)               # "DELIFRU\t"
+        name_raw = re.sub(r'^\d+\.\s*', '', name_raw)                   # "1. "
+        name_raw = re.sub(r'^[•·\-]+\s*', '', name_raw)                 # bullet
+        name_raw = re.sub(r'\t.*$', '', name_raw)                       # hapus tab dan sisa
+        name_raw = re.sub(r'\s*\.{3}\s*$', '', name_raw).strip()        # hapus "..."
+        name_raw = re.sub(r'[…]+\s*$', '', name_raw).strip()            # hapus "…"
+
+        # Skip jika nama terlalu pendek atau masih keyword
+        if len(name_raw) < 4 or SKIP_KEYWORDS.search(name_raw):
+            i += 1
+            continue
+
+        # Cari qty di baris berikutnya (x1, x2, X1)
+        qty = 1
+        price = None
+        j = i + 1
+
+        # Gabungkan baris nama yang terpotong (Palm Sugar + Syrup)
+        # Jika baris berikutnya bukan qty/harga/keyword → lanjutkan nama
+        while j < len(lines):
+            nxt = lines[j].strip()
+            if re.match(r'^[xX]\d+$', nxt):
+                qty = int(re.match(r'^[xX](\d+)$', nxt).group(1))
+                j += 1
+                break
+            if re.match(r'^Rp[\d.,\s]+', nxt) or SKIP_KEYWORDS.search(nxt):
+                break
+            # Baris nama lanjutan (misal "Syrup", "x1" inline di baris yg sama)
+            qty_inline = re.search(r'[xX](\d+)\s*$', nxt)
+            if qty_inline:
+                qty = int(qty_inline.group(1))
+                ext = re.sub(r'\s*[xX]\d+\s*$', '', nxt).strip()
+                if ext and not SKIP_KEYWORDS.search(ext):
+                    name_raw = (name_raw + ' ' + ext).strip()
+                j += 1
+                break
+            if not SKIP_KEYWORDS.search(nxt) and len(nxt) >= 2:
+                name_raw = (name_raw + ' ' + nxt).strip()
+                j += 1
+            else:
                 break
 
-        # Pola B: baris nama item, baris berikutnya "x1" sendirian
-        if i + 1 < len(lines):
-            next_line = lines[i+1].strip()
-            if re.match(r'^x\d+$', next_line, re.IGNORECASE):
-                qty_m = re.match(r'^x(\d+)$', next_line, re.IGNORECASE)
-                if qty_m:
-                    item_qty = int(qty_m.group(1))
-                name = re.sub(r'\.{3}\s*$', '', line).strip()
-                if (len(name) >= 3 and
-                    not re.search(r'Rp|Total|Subtotal|Batalkan|Hubungi|stoa|space|sicepat', name, re.IGNORECASE)):
-                    item_name = name
-                    break
+        # Cari harga — ambil harga TERAKHIR di baris harga (harga setelah diskon)
+        if j < len(lines):
+            price_line = lines[j].strip()
+            prices_m = re.findall(r'Rp([\d.,]+)', price_line)
+            if prices_m:
+                raw = prices_m[-1].replace('.', '').replace(',', '')
+                if raw.isdigit():
+                    price = float(raw)
+                j += 1
 
-        # Pola C: nama produk diikuti harga "Rp75.900" langsung (tanpa x1)
-        if i + 1 < len(lines):
-            next1 = lines[i+1].strip()
-            if re.match(r'^Rp[\d.,]+$', next1):
-                name = re.sub(r'\.{3}\s*$', '', line).strip()
-                if (len(name) >= 3 and
-                    not re.search(r'Rp|Total|Subtotal|Batalkan|Hubungi|stoa|sicepat|SiCepat|Alamat|stoaspace', name, re.IGNORECASE)):
-                    item_name = name
-                    # cek qty di baris berikutnya (opsional)
-                    if i + 2 < len(lines):
-                        next2 = lines[i+2].strip()
-                        qty_m = re.match(r'^x(\d+)$', next2, re.IGNORECASE)
-                        if qty_m:
-                            item_qty = int(qty_m.group(1))
-                    break
+        if name_raw and len(name_raw) >= 3 and price and price >= 100:
+            items.append(ReceiptItem(
+                name=name_raw.upper()[:60],
+                qty=float(qty),
+                unit="",
+                unit_price=price / qty if qty > 0 else price,
+                line_total=price,
+            ))
+            i = j
+        else:
+            i += 1
 
-        # Pola D: nama produk diikuti x1 lalu harga (3 baris)
-        if i + 2 < len(lines):
-            next1 = lines[i+1].strip()
-            next2 = lines[i+2].strip()
-            if (re.match(r'^x\d+$', next1, re.IGNORECASE) and
-                re.match(r'^Rp[\d.,]+$', next2)):
-                qty_m = re.match(r'^x(\d+)$', next1, re.IGNORECASE)
-                if qty_m:
-                    item_qty = int(qty_m.group(1))
-                name = re.sub(r'\.{3}\s*$', '', line).strip()
-                if (len(name) >= 3 and
-                    not re.search(r'Rp|Total|Subtotal|Batalkan|Hubungi|stoa|sicepat', name, re.IGNORECASE)):
-                    item_name = name
-                    break
+    # ── Biaya tambahan = Total Pesanan - Subtotal Produk ──
+    subtotal_produk = 0.0
+    for line in lines:
+        if re.search(r'Subtotal\s+Produk', line, re.IGNORECASE):
+            m = re.search(r'Rp([\d.,]+)', line)
+            if m:
+                raw = m.group(1).replace('.', '').replace(',', '')
+                if raw.isdigit():
+                    subtotal_produk = float(raw)
+            break
 
-    # Total Pesanan: "Total Pesanan: Rp80.910"
+    # Total pesanan sudah diparse di bawah, parse dulu untuk bisa hitung biaya
+    total_pesanan = 0.0
+    total_m_early = re.search(r'Total\s+Pesanan\s*:\s*Rp([\d.,]+)', text, re.IGNORECASE)
+    if total_m_early:
+        raw = total_m_early.group(1).replace('.', '').replace(',', '')
+        if raw.isdigit():
+            total_pesanan = float(raw)
+
+    biaya_tambahan = total_pesanan - subtotal_produk
+    if biaya_tambahan > 100:  # lebih dari Rp100 baru dicatat
+        items.append(ReceiptItem(
+            name=f"BIAYA TAMBAHAN (Ongkir, Layanan, dll)",
+            qty=1.0,
+            unit="",
+            unit_price=biaya_tambahan,
+            line_total=biaya_tambahan,
+        ))
+
+    # ── Total Pesanan ──
     total_m = re.search(r'Total\s+Pesanan\s*:\s*Rp([\d.,]+)', text, re.IGNORECASE)
     if total_m:
         raw = total_m.group(1).replace('.', '').replace(',', '')
         if raw.isdigit():
             result.total = float(raw)
 
-    # Buat summary text yang akan ditampilkan ke user
-    summary_parts = [f"Terdeteksi belanja via Shopee"]
-    if merchant:
-        summary_parts.append(f"Nama Merchant: {merchant}")
-    if item_name:
-        summary_parts.append(f"Item: {item_name}")
-    summary_parts.append(f"Qty: {item_qty}")
-    if result.total:
-        summary_parts.append(f"Total: {fmt_rupiah(result.total)}")
+    result.items = items
 
-    result.shopee_summary = "\n".join(summary_parts)
-    result.shopee_item = item_name or "Item Shopee"
-    result.shopee_qty = item_qty
+    # ── Summary untuk konfirmasi ──
+    summary_lines = [f"Terdeteksi belanja via Shopee"]
+    summary_lines.append(f"Nama Merchant: {result.merchant}")
+    for item in items:
+        qty_str = f" x{int(item.qty)}" if item.qty > 1 else ""
+        summary_lines.append(f"  • {item.name}{qty_str} — {fmt_rupiah(item.line_total)}")
+    if result.total:
+        summary_lines.append(f"Total Pesanan: {fmt_rupiah(result.total)}")
+
+    result.shopee_summary = "\n".join(summary_lines)
+    result.shopee_item = items[0].name if items else "Item Shopee"
+    result.shopee_qty = int(items[0].qty) if items else 1
 
     score = 0.3
     score += 0.3 if result.total else 0.0
-    score += 0.2 if item_name else 0.0
+    score += 0.2 if items else 0.0
     score += 0.2 if merchant else 0.0
     result.confidence = round(score, 2)
 
-    logger.info(f"[OCR] Shopee detail: merchant={merchant!r} item={item_name!r} qty={item_qty} total={result.total}")
+    logger.info(f"[OCR] Shopee detail: merchant={result.merchant!r} items={len(items)} total={result.total}")
     return result
 
 

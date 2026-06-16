@@ -58,12 +58,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
              items=len(result.items), confidence=result.confidence)
         context.user_data["ocr_result"] = result
         context.user_data["ocr_file_id"] = photo.file_id
+
         # Shopee Rincian Pesanan → tampilkan summary langsung
         if result.is_shopee_detail:
             return await handle_shopee_detail(update, context, result)
-        # QRIS → form input manual
+
+        # QRIS → langsung tanya nama toko (tanpa notif deteksi)
         if result.is_qris:
             return await handle_qris_result(update, context, result)
+
+        # Notifikasi deteksi toko untuk struk fisik
+        if result.merchant and result.confidence >= 0.7:
+            await update.message.reply_text(
+                f"🏪 Struk ini terdeteksi sebagai struk *{result.merchant}*",
+                parse_mode="Markdown",
+            )
+
         return await _show_ocr_result(update, result)
     except Exception as e:
         logger.exception(f"[OCR] uid={user_id} failed: {e}")
@@ -81,7 +91,6 @@ async def handle_shopee_detail(update: Update, context: ContextTypes.DEFAULT_TYP
 
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Ya, simpan", callback_data="ocr:ya"),
-        InlineKeyboardButton("✏️ Edit", callback_data="ocr:edit"),
         InlineKeyboardButton("❌ Batal", callback_data="ocr:tidak"),
     ]])
 

@@ -34,6 +34,7 @@ class OcrResult:
     raw_text: str = ""
     confidence: float = 0.0
     provider: str = "ocrspace"
+    is_qris: bool = False
 
 
 # ── Keyword lists ──────────────────────────────────────────────────────
@@ -815,6 +816,80 @@ def _parse_klikindo_orders(text: str) -> OcrResult:
     return result
 
 
+
+def _is_qris_receipt(text: str) -> bool:
+    """Deteksi bukti pembayaran QRIS dari bank (BCA, Mandiri, BRI, dll)."""
+    indicators = [
+        r'qris\s+payment\s+successful',
+        r'qris\s+payment',
+        r'payment\s+successful',
+        r'total\s+payment\s+idr',
+        r'payment\s+to',
+        r'acquirer',
+        r'merchant\s+pan',
+        r'source\s+of\s+fund',
+    ]
+    text_lower = text.lower()
+    hits = sum(1 for p in indicators if re.search(p, text_lower))
+    return hits >= 3
+
+
+def _parse_qris_receipt(text: str) -> OcrResult:
+    """
+    Parse bukti pembayaran QRIS dari bank.
+    Ekstrak: merchant, nominal, tanggal.
+    Flag result.needs_manual_input = True agar bot minta item manual.
+    """
+    from datetime import date as _date
+    result = OcrResult(raw_text=text)
+    result.tx_date = _date.today()
+
+    # Merchant dari "Payment to: NAMA"
+    merchant_m = re.search(r'Payment\s+to[:\s]+([^\n\t\r]+)', text, re.IGNORECASE)
+    if merchant_m:
+        result.merchant = merchant_m.group(1).strip()
+    else:
+        result.merchant = "QRIS"
+
+    # Total dari "Total Payment IDR 80,910.00" atau "IDR 80,910.00"
+    total_m = re.search(r'(?:Total\s+Payment\s+)?IDR\s+([\d,\.]+)', text, re.IGNORECASE)
+    if total_m:
+        raw = total_m.group(1).replace(',', '').replace('.', '')
+        # Handle "80,910.00" → 80910
+        raw2 = re.sub(r'\.\d{2}$', '', total_m.group(1).replace(',', ''))
+        try:
+            result.total = float(raw2)
+        except Exception:
+            pass
+
+    # Tanggal dari format "10 Jun 2026" atau "10/06/2026"
+    date_m = re.search(r'(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})', text, re.IGNORECASE)
+    if date_m:
+        try:
+            from dateutil import parser as dp
+            result.tx_date = dp.parse(date_m.group(0)).date()
+        except Exception:
+            pass
+
+    # Acquirer/bank sebagai info tambahan
+    acquirer_m = re.search(r'Acquirer[:\s]+([^\n\t\r]+)', text, re.IGNORECASE)
+    if acquirer_m:
+        result.provider = acquirer_m.group(1).strip()
+
+    # Flag bahwa ini butuh input manual item
+    result.is_qris = True
+    result.items = []  # kosong — akan diisi manual
+
+    score = 0.3
+    score += 0.4 if result.total else 0.0
+    score += 0.3 if result.merchant else 0.0
+    result.confidence = round(score, 2)
+
+    logger.info(f"[OCR] QRIS: merchant={result.merchant!r} total={result.total} date={result.tx_date}")
+    return result
+
+
+
 def _is_shopee_screenshot(text: str) -> bool:
     """Deteksi apakah ini screenshot halaman pesanan Shopee/marketplace."""
     indicators = [
@@ -932,6 +1007,10 @@ def _parse_receipt_text(text: str) -> OcrResult:
     text = _normalize_ocr(text)
 
     # Deteksi format marketplace/app lebih dulu
+    if _is_qris_receipt(text):
+        logger.info("[OCR] QRIS payment receipt detected")
+        return _parse_qris_receipt(text)
+
     if _is_klikindo_screenshot(text):
         logger.info("[OCR] Klikindomaret/app screenshot detected")
         return _parse_klikindo_orders(text)

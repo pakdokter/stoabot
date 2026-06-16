@@ -51,6 +51,7 @@ TOTAL_KEYWORDS = [
     r'\btotal\s+bayar\b', r'\btotal\s+pembayaran\b',
     r'\btotal\s+incl\b', r'\btotal\s+include\b',
     r'\btotal\s+termasuk\b', r'\bitem\(s\)\b',
+    r'\btotal\s+item\b',  # Alfamart: "Total Item" = total belanja
     # OCR noise variants
     r'\brotal\b', r'\bt0tal\b', r'\bt\*tal\b', r'\btoial\b',
 ]
@@ -58,7 +59,8 @@ PAYMENT_KEYWORDS = [
     r'\btunai\b', r'\bcash\b', r'\bbayar\b', r'\bdibayar\b',
     r'\btransfer\b', r'\bdebit\b', r'\bkredit\b', r'\bkartu\b',
     r'\bqris\b', r'\bova\b', r'\bgopay\b', r'\bshopee\b',
-    r'\bdana\b', r'\blinkaja\b',
+    r'\bdana\b', r'\blinkaja\b', r'\bbrimo\b', r'\bbri\s+brimo\b',
+    r'\bshopeepay\b', r'\bovo\b', r'\bmandiri\b',
     # OCR noise variants
     r'\brunai\b', r'\btunal\b', r'\btumai\b', r'\bbayaf\b',
     r'\btuna\s+i\b', r'\btunail\b',
@@ -75,13 +77,13 @@ SAVINGS_KEYWORDS = [
     r'\bharga\s+jual\b', r'\brga\s+jual\b',
     r'\bdpp\s*=\b', r'\bppn\s*=\b',
     r'\bpwp\b', r'\blp\s+\d\b',
-    r'\btotal\s+qty\b', r'\bjml\s+item\b',
+    r'\btotal\s+qty\b', r'\bjml\s+item\s+\d\b',  # "Total Item 3" bukan total belanja jika ada qty
     r'\bppn\s+included\b', r'\bitem\(s\)\b', r'\bqty\(s\)\b',
     r'\bincluded\s+in\s+total\b',
     r'\bppn\s+dibebaskan\b', r'\bpkp\s+dibebaskan\b',
     r'\bharga\s+jual\b', r'\brga\s+jual\b',
     r'\bdpp\s*=', r'\bnpwp\b',
-    r'\btotal\s+disc\.?\b', r'\btotal\s+item\b',  # Alfamart total disc/item
+    r'\btotal\s+disc\.?\b',  # Alfamart total disc/item
     r'\btotal\s+poin\b', r'\ba-poin\b',
     r'\bcpm\s+qris\b',  # payment method bukan total
 ]

@@ -171,7 +171,7 @@ async def _show_laporan(update_or_query, user_id: int, date_from: date, date_to:
                 Transaction.transaction_date >= date_from,
                 Transaction.transaction_date <= date_to,
             )
-            .order_by(desc(Transaction.transaction_date))
+            .order_by(Transaction.transaction_date, Transaction.created_at)
             .limit(30)
         )
         txs = result.scalars().all()

@@ -23,7 +23,8 @@ from bot.models import User
 from bot.config import settings
 
 SESSION_TIMEOUT_HOURS = 24
-WAITING_PASSWORD = 10
+WAITING_USERNAME = 10
+WAITING_PASSWORD = 11
 
 
 def _hash(password: str) -> str:
@@ -97,7 +98,7 @@ async def ensure_registered(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # ─────────────────────────────────────────────
 
 async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mulai proses login — minta password."""
+    """Mulai proses login — minta username dulu."""
     user_id = update.effective_user.id
 
     # Admin tidak perlu login
@@ -113,16 +114,31 @@ async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     await update.message.reply_text(
-        "🔐 *Login Stoabot*\n\nMasukkan password kamu:",
+        "🔐 *Login Stoabot*\n\nUsername:",
         parse_mode="Markdown",
     )
+    return WAITING_USERNAME
+
+
+async def handle_username_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Proses input username, lalu minta password."""
+    username = update.message.text.strip()
+
+    if len(username) < 2:
+        await update.message.reply_text("❌ Username tidak valid. Coba lagi:")
+        return WAITING_USERNAME
+
+    context.user_data["login_username"] = username.lower()
+
+    await update.message.reply_text("Password:")
     return WAITING_PASSWORD
 
 
 async def handle_password_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Proses input password dari user."""
+    """Proses input password — cari user berdasarkan username + password."""
     user_id = update.effective_user.id
     password = update.message.text.strip()
+    username = context.user_data.get("login_username", "")
 
     # Hapus pesan password agar tidak terlihat di chat
     try:
@@ -130,48 +146,52 @@ async def handle_password_input(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception:
         pass
 
+    if not username:
+        await update.message.reply_text("❌ Session expired. Ketik /login ulang.")
+        return ConversationHandler.END
+
     try:
         async with AsyncSessionLocal() as session:
-            # Cari user berdasarkan telegram_id yang sudah terdaftar admin
-            user = await session.get(User, user_id)
+            # Cari berdasarkan pin_name (username yang dibuat admin)
+            result = await session.execute(
+                select(User).where(
+                    User.pin_name == username,
+                    User.is_active == True,
+                )
+            )
+            user = result.scalar_one_or_none()
 
             if not user:
-                # Cari berdasarkan pin_name jika user baru pertama login
-                # (admin sudah register tapi user belum pernah chat)
-                result = await session.execute(
-                    select(User).where(User.pin == _hash(password), User.is_active == True)
-                )
-                user = result.scalar_one_or_none()
-
-                if user and user.id != user_id:
-                    # Bind telegram_id ke akun ini
-                    user.id = user_id
-                    user.username = update.effective_user.username or ""
-                    user.last_seen = datetime.now(timezone.utc)
-                    await session.commit()
-
-            if not user or not user.pin:
                 await update.message.reply_text(
-                    "❌ Password salah atau akun tidak ditemukan.\n"
+                    "❌ Username tidak ditemukan.\n"
                     "Hubungi admin untuk mendapatkan akses."
                 )
+                context.user_data.pop("login_username", None)
+                return ConversationHandler.END
+
+            if not user.pin or user.pin != _hash(password):
+                await update.message.reply_text(
+                    "❌ Password salah.\nKetik /login untuk coba lagi."
+                )
+                context.user_data.pop("login_username", None)
                 return ConversationHandler.END
 
             if not user.is_active:
                 await update.message.reply_text("⛔ Akun dinonaktifkan. Hubungi admin.")
                 return ConversationHandler.END
 
-            if user.pin != _hash(password):
-                await update.message.reply_text(
-                    "❌ Password salah. Coba lagi dengan /login."
-                )
-                return ConversationHandler.END
+            # Bind telegram_id ke akun jika belum (login pertama kali)
+            if user.id < 0:
+                user.id = user_id
+                user.username = update.effective_user.username or ""
 
-            # Login berhasil
             user.last_seen = datetime.now(timezone.utc)
             await session.commit()
+            await session.refresh(user)
+
             context.user_data["db_user"] = user
             context.user_data["session_verified"] = True
+            context.user_data.pop("login_username", None)
 
             await update.message.reply_text(
                 f"✅ *Login berhasil!*\n\n"
@@ -202,6 +222,9 @@ def build_login_conv() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[CommandHandler("login", cmd_login)],
         states={
+            WAITING_USERNAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_username_input),
+            ],
             WAITING_PASSWORD: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_password_input),
             ],

@@ -418,12 +418,102 @@ def _parse_items_format_fadhilah(lines: list) -> list:
     return items
 
 
-def _is_fadhilah_format(lines: list) -> bool:
-    """Deteksi format Fadhilah: ada baris 'N. NAMA  Rp TOTAL'."""
-    item_no_count = sum(1 for l in lines if re.match(r'^\d+\.\s+[A-Z]', l))
-    has_rp_space = any(re.search(r'Rp\s+\d', l) for l in lines)
-    return item_no_count >= 1 and has_rp_space
 
+def _is_fadhilah_format(lines: list) -> bool:
+    """Deteksi format Fadhilah: ada baris 'N. NAMA' dan baris 'N x Rp SATUAN  Rp TOTAL'."""
+    item_no_count = sum(1 for l in lines if re.match(r'^\d+\.\s+[A-Z]', l))
+    has_qty_x = any(re.match(r'^\d+\s*[xX]\s*(Rp|Kp)', l) for l in lines)
+    return item_no_count >= 1 and has_qty_x
+
+
+def _parse_items_format_fadhilah(lines: list) -> list:
+    """
+    Format C — Fadhilah Frozen Foods:
+
+      1. NAMA ITEM QTY_INFO
+         (keterangan tambahan opsional, misal PROMO)
+         QTY X Rp SATUAN     Rp TOTAL
+
+    Semua baris antara nomor item dan baris qty-x adalah bagian nama.
+    """
+    items = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # Deteksi baris nomor item: "1. NAMA ..." atau "1. NAMA\tRp TOTAL"
+        m = re.match(r'^(\d+)\.\s+(.+)', line)
+        if not m:
+            i += 1
+            continue
+
+        # Kumpulkan nama (bisa multiline sebelum baris qty)
+        name_parts = [m.group(2).strip()]
+        j = i + 1
+
+        # Lanjutkan ambil baris nama selama bukan baris qty/total/footer
+        while j < len(lines):
+            nxt = lines[j].strip()
+            # Baris qty: "1 X Rp 55.000" atau "2 X Rp 65.000  Rp 130.000"
+            if re.match(r'^\d+\s*[xX]\s*(Rp|Kp)', nxt, re.IGNORECASE):
+                break
+            # Baris total/sub total/footer
+            if re.match(r'^(Total|Sub|Bayar|Kembali|JAZAK|Barang)', nxt, re.IGNORECASE):
+                break
+            # Baris nomor item berikutnya
+            if re.match(r'^\d+\.\s+[A-Z]', nxt):
+                break
+            # Baris yang hanya berisi keterangan seperti "(PROMO)"
+            if re.match(r'^\(.*\)\s*$', nxt):
+                name_parts.append(nxt)
+                j += 1
+                continue
+            # Baris lain yang masuk akal sebagai lanjutan nama
+            if len(nxt) >= 2 and not re.match(r'^Rp', nxt):
+                name_parts.append(nxt)
+            j += 1
+
+        # Parse baris qty: "2 X Rp 65.000  Rp 130.000" atau "2 X Rp 65.000\tRp 130.000"
+        qty = 1.0
+        unit_price = 0.0
+        line_total = 0.0
+
+        if j < len(lines):
+            qty_line = lines[j].strip()
+            qty_m = re.match(r'^(\d+)\s*[xX]\s*(Rp|Kp)\.?\s*([\d.,]+)', qty_line, re.IGNORECASE)
+            if qty_m:
+                qty = float(qty_m.group(1))
+                raw_unit = qty_m.group(3).replace('.', '').replace(',', '')
+                unit_price = float(raw_unit) if raw_unit.isdigit() else 0.0
+
+                # Cari total di sisa baris yang sama
+                total_m = re.search(r'Rp\.?\s*([\d.,]+)\s*$', qty_line)
+                if total_m:
+                    raw_total = total_m.group(1).replace('.', '').replace(',', '')
+                    line_total = float(raw_total) if raw_total.isdigit() else unit_price * qty
+                else:
+                    line_total = unit_price * qty
+
+                j += 1  # lewati baris qty
+
+        # Bersihkan nama
+        name = ' '.join(name_parts)
+        name = re.sub(r'\tRp[\d.,\s]+$', '', name)      # hapus harga yang ikut terbaca
+        name = re.sub(r'Rp[\d.,\s]+$', '', name).strip() # hapus Rp di akhir
+        name = re.sub(r'\s+\d+[+]\d+\s*$', '', name)  # hapus "12+2" di akhir
+        name = name.strip()
+
+        if name and len(name) >= 2 and line_total >= 100:
+            items.append(ReceiptItem(
+                name=name.upper()[:60],
+                qty=qty,
+                unit='',
+                unit_price=unit_price if unit_price >= 100 else line_total / qty,
+                line_total=line_total,
+            ))
+
+        i = j
+    return items
 
 
 def _parse_items_format_a(lines: list) -> list:
@@ -785,6 +875,11 @@ def _normalize_ocr(text: str) -> str:
         cleaned = re.sub(r'(?<=[\d])O(?=[\d,.])', '0', cleaned)  # huruf O di antara angka
         # "RD363.636" → "Rp363.636" (OCR noise: D bukan p)
         cleaned = re.sub(r'\bRD(\d)', r'Rp\1', cleaned)
+        # "Kp" → "Rp" (OCR noise: K bukan R)
+        cleaned = re.sub(r'\bKp\s', 'Rp ', cleaned)
+        # "Rp 315. 000" → "Rp 315000" (spasi setelah titik ribuan)
+        cleaned = re.sub(r'(Rp\.?\s*\d+)\.\s+(\d{3})\b', r'\1\2', cleaned)
+        cleaned = re.sub(r'(\d+)\.\s+(\d{3})\b', r'\1\2', cleaned)
         # "MI" di baris sendiri setelah nama item → kemungkinan "Ml" (mililiter)
         # handled di join_fragmented
         lines_out.append(cleaned)

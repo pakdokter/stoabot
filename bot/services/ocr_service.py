@@ -123,11 +123,15 @@ SKIP_LINE_PATTERNS = [
     r'\bpotensi\s+poin\b',                   # poin info
     r'\bkritik.*saran\b',                     # kritik saran
     r'\bmember\s*:\s*[a-z*]+',               # MEMBER : BAIQ
+    r'\bjazakallahu\b',                       # Fadhilah footer
+    r'\bbarang\s+yg\s+sudah\b',            # Fadhilah footer
+    r'\bpat\s+di\s+kembalikan\b',          # Fadhilah footer
     r'\bstruk\s+anda\s+akan\b',             # struk dikirim
     r'\bdikirim\s+ke\s+aplikasi\b',         # dikirim ke aplikasi
     r'\bbon\s+[a-z0-9]',                      # Bon nomor struk
     r'\btgl\.\s+\d',                         # Tgl. tanggal
     r'\bv\.\.\.',                            # V...
+    r'^\d+\s*[xX]\s*rp',                       # "2 x Rp 55.000" (qty x satuan)
     r'\bcpm\s+qris\b',                       # CPM QRIS (payment method)
     r'\bsms/wa\b',                            # SMS/WA
     r'^-?(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|'
@@ -175,6 +179,9 @@ NON_ITEM_WORDS = {
     'poin', 'member', 'expired', 'alfagift', 'potensi',
     'struk', 'dikirim', 'aplikasi', 'kritik', 'saran',
     'bon', 'kasir', 'kembalian', 'disc',
+    # Fadhilah footer
+    'jazakallahu', 'khoir', 'kembalikan', 'hubungi',
+    'whatsapp', 'admin', 'pancor', 'lombok', 'tenggara',
 }
 
 
@@ -352,6 +359,71 @@ def _parse_item_line_format_b(line: str) -> Optional[ReceiptItem]:
         unit_price=unit_price,
         line_total=line_total,
     )
+
+
+
+def _parse_items_format_fadhilah(lines: list) -> list:
+    """
+    Parse format Fadhilah Frozen Foods:
+      1. NAMA ITEM QTY_INFO    Rp TOTAL
+         QTY x Rp SATUAN        (baris detail, dilewati)
+
+    Ciri: baris item diawali nomor "N. " dan harga pakai "Rp " (spasi).
+    """
+    items = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # Pola: "1. NAMA ITEM ..."  dengan atau tanpa harga di baris yang sama
+        m = re.match(r'^(\d+)\.\s+(.+)', line)
+        if m:
+            name_raw = m.group(2).strip()
+            # Pisah nama dari harga di baris yang sama: "YOMAS SO JUMBO ISI 12+2  Rp 110.000"
+            money_m = re.search(r'\bRp\.?\s+([\d.,]+)\s*$', name_raw)
+            if money_m:
+                total_raw = money_m.group(1).replace('.','').replace(',','')
+                line_total = float(total_raw) if total_raw.isdigit() else None
+                name = name_raw[:money_m.start()].strip()
+            else:
+                # Coba cari harga di baris berikutnya
+                line_total = None
+                name = name_raw
+                if i + 1 < len(lines):
+                    nxt_money = _extract_money(lines[i+1])
+                    if nxt_money:
+                        line_total = nxt_money[-1][0]
+
+            # Bersihkan nama: hapus qty info di akhir seperti "12+2"
+            name = re.sub(r'\s+\d+[+]\d+\s*$', '', name).strip()
+            name = re.sub(r'\s+[xX]\s*\d+\s*$', '', name).strip()
+
+            # Cari qty dari baris berikutnya: "2 x Rp 55.000"
+            qty = 1.0
+            j = i + 1
+            if j < len(lines):
+                qty_m = re.match(r'^(\d+)\s*[xX]\s*Rp', lines[j], re.IGNORECASE)
+                if qty_m:
+                    qty = float(qty_m.group(1))
+                    i = j  # skip baris qty
+
+            if name and len(name) >= 2 and line_total and line_total >= 100:
+                items.append(ReceiptItem(
+                    name=name.upper()[:60],
+                    qty=qty,
+                    unit="",
+                    unit_price=line_total / qty if qty > 0 else line_total,
+                    line_total=line_total,
+                ))
+        i += 1
+    return items
+
+
+def _is_fadhilah_format(lines: list) -> bool:
+    """Deteksi format Fadhilah: ada baris 'N. NAMA  Rp TOTAL'."""
+    item_no_count = sum(1 for l in lines if re.match(r'^\d+\.\s+[A-Z]', l))
+    has_rp_space = any(re.search(r'Rp\s+\d', l) for l in lines)
+    return item_no_count >= 1 and has_rp_space
+
 
 
 def _parse_items_format_a(lines: list) -> list:
@@ -1423,13 +1495,18 @@ def _parse_receipt_text(text: str) -> OcrResult:
             result.total = None
 
     # ── Item extraction ──
-    # Coba Format A dulu (multi-line), lalu Format B (single-line)
+    # Fadhilah: numbered items "1. NAMA  Rp TOTAL"
+    items_fadhilah = _parse_items_format_fadhilah(lines) if _is_fadhilah_format(lines) else []
     items_a = _parse_items_format_a(lines)
     items_b = _parse_items_format_b(lines)
     items_mrdiy = _parse_items_format_mrdiy(lines)
 
-    # Pilih format dengan item terbanyak
-    items = max([items_a, items_b, items_mrdiy], key=lambda x: len(x))
+    # Fadhilah format diprioritaskan jika terdeteksi
+    if items_fadhilah:
+        items = items_fadhilah
+    else:
+        # Pilih format dengan item terbanyak
+        items = max([items_a, items_b, items_mrdiy], key=lambda x: len(x))
 
     # Validasi: sum(line_total) harus mendekati total
     if items and result.total:

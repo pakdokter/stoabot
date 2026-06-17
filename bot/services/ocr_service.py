@@ -146,6 +146,8 @@ SKIP_LINE_PATTERNS = [
     r'\bv\.\.\.',                            # V...
     r'^\d+\s*[xX]\s*rp',                       # "2 x Rp 55.000" (qty x satuan)
     r'\bcpm\s+qris\b',                       # CPM QRIS (payment method)
+    r'^disc\.?\s*[-+]?[\d.,]+',              # "Disc. -1.000" per item bukan item
+    r'\bken?balian\b',                        # kembalian/kenbalian
     r'\bsms/wa\b',                            # SMS/WA
     r'^-?(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|'
     r'januari|februari|maret|april|mei|juni|juli|agustus|'
@@ -427,6 +429,68 @@ def _parse_items_format_fadhilah(lines: list) -> list:
                     unit_price=line_total / qty if qty > 0 else line_total,
                     line_total=line_total,
                 ))
+        i += 1
+    return items
+
+
+
+
+def _is_format_f(lines: list) -> bool:
+    """
+    Format F — Harnila Store / kasir app generic.
+    Ciri: baris "Nx HARGA  TOTAL" (spasi setelah x, bukan X besar).
+    Contoh: "   1x 12.000    12.000"
+    """
+    return any(re.match(r'^\s*\d+x\s+[\d.,]+', l) for l in lines)
+
+
+def _parse_items_format_f(lines: list) -> list:
+    """
+    Format F — Harnila Store / kasir app dengan format:
+      NAMA ITEM
+         Nx HARGA_SATUAN    TOTAL
+    """
+    SKIP = {'total', 'tunai', 'kembali', 'terima', 'kasih', 'bon',
+            'npwp', 'telp', 'wa', 'store', 'toko'}
+
+    items = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+
+        # Baris qty: "1x 12.000   12.000" atau "1x 5.000"
+        qty_m = re.match(r'^(\d+)x\s+([\d.,]+)\s*([\d.,]*)\s*$', line)
+        if qty_m:
+            qty = float(qty_m.group(1))
+            raw_price = qty_m.group(2).replace('.', '').replace(',', '')
+            raw_total = qty_m.group(3).replace('.', '').replace(',', '') if qty_m.group(3) else ''
+
+            unit_price = float(raw_price) if raw_price.isdigit() else 0.0
+            line_total = float(raw_total) if raw_total.isdigit() else unit_price * qty
+
+            # Ambil nama dari baris sebelumnya
+            name = None
+            j = i - 1
+            while j >= 0:
+                prev = lines[j].strip()
+                if (len(prev) >= 2 and
+                    not re.match(r'^\d+x\s', prev) and
+                    not re.match(r'^(Total|Tunai|Kembali|Rp)', prev, re.IGNORECASE)):
+                    words = set(re.findall(r'[a-z]+', prev.lower()))
+                    if not words & SKIP:
+                        name = prev
+                        break
+                j -= 1
+
+            if name and line_total >= 100:
+                items.append(ReceiptItem(
+                    name=name.upper()[:60],
+                    qty=qty,
+                    unit='',
+                    unit_price=unit_price,
+                    line_total=line_total,
+                ))
+
         i += 1
     return items
 
@@ -1488,6 +1552,11 @@ def _parse_receipt_text(text: str) -> OcrResult:
         'sb minimarket': 'Sinar Bahagia',
         'toko bahan kue': 'Amanah',
         'stoa space': 'Stoa Space',
+        # Toko lain
+        'harnila': 'Harnila Store',
+        'sumber alfaria': 'Alfamart',
+        'pt.sumber alfaria': 'Alfamart',
+        'pt. sumber alfaria': 'Alfamart',
     }
 
     text_lower = text.lower()
@@ -1599,14 +1668,18 @@ def _parse_receipt_text(text: str) -> OcrResult:
     # Prioritas deteksi format:
     # 1. Fadhilah (numbered items "N. NAMA")
     # 2. MR D.I.Y. (nama → SKU → barcode+harga)
-    # 3. Format A/B (fallback)
+    # 3. Format F (Harnila: "Nx HARGA  TOTAL")
+    # 4. Format A/B (fallback)
     items_fadhilah = _parse_items_format_fadhilah(lines) if _is_fadhilah_format(lines) else []
     items_mrdiy = _parse_items_format_mrdiy(lines)
+    items_f = _parse_items_format_f(lines) if _is_format_f(lines) else []
 
     if items_fadhilah:
         items = items_fadhilah
     elif items_mrdiy and result.merchant and 'MR' in (result.merchant or '').upper():
         items = items_mrdiy
+    elif items_f:
+        items = items_f
     elif items_mrdiy and len(items_mrdiy) >= 1:
         # Verifikasi: semua item MR DIY harus punya harga wajar
         mrdiy_ok = all(100 <= i.line_total <= 5_000_000 for i in items_mrdiy)

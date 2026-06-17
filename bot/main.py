@@ -13,7 +13,9 @@ from bot.config import settings
 from bot.database import init_db, AsyncSessionLocal
 from bot.models import User
 from bot.handlers.auth import (
-    cmd_adduser, cmd_users,
+    cmd_adduser, cmd_listuser, cmd_deleteuser, cmd_resetpass,
+    cmd_users, cmd_deactivate,
+    cmd_logout, build_login_conv,
     handle_verify_callback,
     handle_name_input as auth_name_input,
     ensure_registered,
@@ -143,7 +145,13 @@ def create_app() -> Application:
     app.add_handler(CommandHandler("riwayat", cmd_riwayat))
     app.add_handler(CommandHandler("ringkas", cmd_ringkas))
     app.add_handler(CommandHandler("cari", cmd_cari))
+    # Auth commands
+    app.add_handler(build_login_conv())
+    app.add_handler(CommandHandler("logout", cmd_logout))
     app.add_handler(CommandHandler("adduser", cmd_adduser))
+    app.add_handler(CommandHandler("listuser", cmd_listuser))
+    app.add_handler(CommandHandler("deleteuser", cmd_deleteuser))
+    app.add_handler(CommandHandler("resetpass", cmd_resetpass))
     app.add_handler(CommandHandler("users", cmd_users))
 
     # Callback & message handlers

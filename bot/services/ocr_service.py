@@ -435,13 +435,101 @@ def _parse_items_format_fadhilah(lines: list) -> list:
 
 
 
+
+def _parse_harnila_oneliner(text: str) -> list:
+    """
+    Handle OCR Harnila Store yang ter-join satu baris panjang.
+    Contoh: "Terima kasih  Kembali  1x 5,000  Lem eyelash  1x 5.000  Jarum pentul 5K  1x 12.000  12K"
+    
+    Pola yang dapat dideteksi: pasangan nama-item + "Nx HARGA"
+    """
+    items = []
+    # Temukan semua pasangan qty+harga dalam teks
+    # Pola: "nama item ... Nx harga"
+    # Tokenize dengan split pada pola qty
+    tokens = re.split(r'(\d+x\s+[\d.,]+)', text)
+    
+    STOP_WORDS = {
+        'tunai','kembali','terima','kasih','total','rp','bon',
+        'kasir','member','poin','anda','akan','expired','dikirim'
+    }
+
+    for i in range(0, len(tokens)-1, 2):
+        name_part = tokens[i].strip() if i < len(tokens) else ''
+        qty_str = tokens[i+1] if i+1 < len(tokens) else None
+        if not qty_str or not re.match(r'\d+x\s+[\d.,]+', qty_str):
+            continue
+
+        # Ambil nama: cari segmen teks antara dua stop word terakhir
+        words = name_part.split()
+        STOP_WORDS_SET = {
+            'tunai','kembali','terima','kasih','total','rp','bon',
+            'kasir','member','poin','anda','akan','expired','dikirim'
+        }
+        # Cari posisi stop word dari kanan
+        # Nama item adalah kata-kata di antara stop word terakhir dan stop word sebelumnya
+        stop_positions = [idx for idx, w in enumerate(words)
+                          if w.lower().rstrip('.,;') in STOP_WORDS_SET]
+
+        if stop_positions:
+            # Cari blok kata di antara stop positions
+            # Coba ambil segmen setelah stop word terakhir dulu
+            last_stop = stop_positions[-1]
+            candidate = words[last_stop+1:]
+
+            # Jika kosong, cari segmen terpanjang di antara stop words
+            if not candidate:
+                best = []
+                prev_stop = -1
+                for sp in stop_positions:
+                    seg = words[prev_stop+1:sp]
+                    seg_clean = [w for w in seg if not re.match(r'^[\d#.,]+$', w)]
+                    if len(seg_clean) > len(best):
+                        best = seg_clean
+                    prev_stop = sp
+                candidate = best
+        else:
+            candidate = [w for w in words if not re.match(r'^[\d#.,]+$', w)
+                         and not re.match(r'^Rp', w, re.IGNORECASE)]
+
+        name_words = [w for w in candidate
+                      if not re.match(r'^\d+[.,]\d{3}$', w)
+                      and not re.match(r'^#\d+', w)]
+
+        if not name_words:
+            continue
+
+        name = ' '.join(name_words).strip()
+        
+        # Parse qty dan harga
+        qty_m = re.match(r'(\d+)x\s+([\d.,]+)', qty_str)
+        if not qty_m:
+            continue
+        qty = float(qty_m.group(1))
+        raw_price = qty_m.group(2).replace('.', '').replace(',', '')
+        price = float(raw_price) if raw_price.isdigit() else 0.0
+        
+        if price >= 100 and len(name) >= 2:
+            items.append(ReceiptItem(
+                name=name.upper()[:60],
+                qty=qty,
+                unit='',
+                unit_price=price,
+                line_total=price * qty,
+            ))
+    
+    return items
+
+
+
 def _is_format_f(lines: list) -> bool:
     """
     Format F — Harnila Store / kasir app generic.
-    Ciri: baris "Nx HARGA  TOTAL" (spasi setelah x, bukan X besar).
-    Contoh: "   1x 12.000    12.000"
+    Ciri: baris atau teks mengandung "Nx HARGA" (lowercase x, spasi setelah x).
+    Contoh: "   1x 12.000    12.000" atau one-liner gabungan.
     """
-    return any(re.match(r'^\s*\d+x\s+[\d.,]+', l) for l in lines)
+    full_text = ' '.join(lines)
+    return bool(re.search(r'\d+x\s+[\d.,]+', full_text))
 
 
 def _parse_items_format_f(lines: list) -> list:
@@ -452,6 +540,11 @@ def _parse_items_format_f(lines: list) -> list:
     """
     SKIP = {'total', 'tunai', 'kembali', 'terima', 'kasih', 'bon',
             'npwp', 'telp', 'wa', 'store', 'toko'}
+
+    # Jika OCR ter-join satu baris panjang, gunakan parser khusus
+    full_text = ' '.join(lines)
+    if len(lines) <= 3 and re.search(r'\d+x\s+[\d.,]+', full_text):
+        return _parse_harnila_oneliner(full_text)
 
     items = []
     i = 0
@@ -946,6 +1039,17 @@ def _normalize_ocr(text: str) -> str:
         cleaned = re.sub(r'\bRD(\d)', r'Rp\1', cleaned)
         # "Kp" → "Rp" (OCR noise: K bukan R)
         cleaned = re.sub(r'\bKp\s', 'Rp ', cleaned)
+        # "Pisc." → "Disc." (OCR noise: P→D)
+        cleaned = re.sub(r'\bPisc\.', 'Disc.', cleaned)
+        # "Ju1" → "Jul" (OCR noise: 1 bukan l)
+        cleaned = re.sub(r'\bJu1\b', 'Jul', cleaned)
+        # "31-Ju1-2027" format → skip handled via SKIP_LINE_PATTERNS
+        # "lotal/otal Belania/Belanja" → "Total Belanja" (OCR noise)
+        cleaned = re.sub(r'\b[lL]?otal\s+[Bb]elan[ji]a', 'Total Belanja', cleaned)
+        # "Total Iten" → "Total Item"
+        cleaned = re.sub(r'\bTotal\s+Iten\b', 'Total Item', cleaned, flags=re.IGNORECASE)
+        # "[unai" → "Tunai"
+        cleaned = re.sub(r'^\[unai\b', 'Tunai', cleaned)
 
         # "Rp 315. 000" → "Rp 315000" (spasi setelah titik ribuan)
         cleaned = re.sub(r'(Rp\.?\s*\d+)\.\s+(\d{3})\b', r'\1\2', cleaned)
@@ -1557,6 +1661,9 @@ def _parse_receipt_text(text: str) -> OcrResult:
         'sumber alfaria': 'Alfamart',
         'pt.sumber alfaria': 'Alfamart',
         'pt. sumber alfaria': 'Alfamart',
+        'dineta': 'PT Dineta Jaya',
+        'pt. dineta': 'PT Dineta Jaya',
+        'pt dineta': 'PT Dineta Jaya',
     }
 
     text_lower = text.lower()

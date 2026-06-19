@@ -798,14 +798,144 @@ def _parse_items_format_mrdiy(lines: list) -> list:
     """
     Parse format D — MR D.I.Y.
 
-    Pola per item:
-      NAMA ITEM                    ← baris nama (huruf)
-      CB023C8025 - 12/24  73,000   ← SKU-batch + harga satuan
+    Pola per item (2 varian):
+    Varian 1 (struk panjang):
+      NAMA ITEM
+      CB023C8025 - 12/24  73,000   ← SKU-batch
       6953901701900  1 X  73,000   ← barcode + qty + total
 
-    SKU pattern: diawali huruf-angka-dash-angka, BERBEDA dari nama produk
-    yang mengandung kode model seperti "DY-91228" (brand code, bukan SKU).
+    Varian 2 (struk pendek):
+      NAMA ITEM
+      12/24  73,000                ← batch saja
+      1 x  75,000                  ← qty + harga (tanpa barcode)
+      atau langsung harga saja
     """
+    MRDIY_SKIP = {
+        'change', 'cash', 'ppn', 'included', 'total', 'qty', 'item',
+        'invoice', 'operator', 'penukaran', 'waktu', 'customer', 'care',
+        'pesan', 'whatsapp', 'email', 'website', 'yuk', 'bantu',
+        'kualitas', 'pelayanan', 'senin', 'jumat', 'gedung', 'jalan',
+        'jakarta', 'selatan', 'ruko', 'selong', 'pancor',
+    }
+
+    def _is_sku_line(line):
+        """SKU MR DIY: CB023C8025 - 12/24 atau 12/24 (batch number)."""
+        stripped = line.strip()
+        # SKU: huruf+angka + " - " + angka/angka
+        if re.match(r'^[A-Z]{2,}\d+[A-Z0-9]*\s+-\s+\d+/\d+', stripped):
+            return True
+        # Batch saja: "12/24  harga" atau "10/189  harga"
+        if re.match(r'^\d+/\d+\s+[\d,]+\s*$', stripped):
+            return True
+        return False
+
+    def _is_barcode_price_line(line):
+        """Baris barcode (7+ digit) atau qty-harga sederhana '1 x harga'."""
+        stripped = line.strip()
+        if re.match(r'^\d{7,}[\s\t]', stripped):
+            return True
+        # "1 x  75,000" atau "1 X  22,000" — qty + harga tanpa barcode
+        if re.match(r'^\d{1,3}\s+[xX]\s+[\d,]+', stripped):
+            return True
+        return False
+
+    def _extract_item_price(line):
+        money = _extract_money(line)
+        if not money:
+            return None, None, None
+        # Filter barcode di awal
+        barcode_val = None
+        m_bc = re.match(r'^(\d{7,})', line.strip())
+        if m_bc:
+            try:
+                barcode_val = float(m_bc.group(1).replace(',', '').replace('.', ''))
+            except Exception:
+                pass
+        money = [(v, p) for v, p in money if v != barcode_val]
+        if not money:
+            return None, None, None
+
+        qty_match = re.search(r'(\d{1,3})\s*[xX]\s*(\d)', line)
+        qty = float(qty_match.group(1)) if qty_match else 1.0
+        if len(money) >= 2:
+            unit_price, line_total = money[-2][0], money[-1][0]
+        else:
+            unit_price = line_total = money[-1][0]
+        return qty, unit_price, line_total
+
+    items = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        has_alpha = bool(re.search(r'[A-Za-z]', line))
+        is_sku = _is_sku_line(line)
+        is_barcode = _is_barcode_price_line(line)
+
+        # Skip baris non-item
+        if not has_alpha or is_sku or is_barcode:
+            i += 1
+            continue
+        words = set(re.findall(r'[a-zA-Z]+', line.lower()))
+        if words & MRDIY_SKIP:
+            i += 1
+            continue
+        if not _is_item_name_line(line):
+            i += 1
+            continue
+
+        name_raw = re.sub(r'\t.*', '', line).strip()
+        name_clean = name_raw.rstrip('-').strip()
+
+        # Cari harga di baris-baris berikutnya
+        j = i + 1
+
+        # Lewati baris SKU/batch
+        while j < len(lines) and _is_sku_line(lines[j]):
+            j += 1
+
+        # Cek baris berikutnya: barcode, qty-harga, atau harga murni
+        if j < len(lines) and _is_barcode_price_line(lines[j]):
+            qty, unit_price, line_total = _extract_item_price(lines[j])
+
+            # Jika baris qty tidak punya total (hanya "1 x"), cek baris berikutnya
+            if line_total and line_total < 100 and j + 1 < len(lines):
+                next_money = _extract_money(lines[j + 1])
+                if next_money:
+                    line_total = next_money[-1][0]
+                    j += 1
+
+            if line_total and line_total >= 100 and len(name_clean) >= 2:
+                items.append(ReceiptItem(
+                    name=name_clean.upper()[:60],
+                    qty=qty or 1.0,
+                    unit="",
+                    unit_price=unit_price or line_total,
+                    line_total=line_total,
+                ))
+            i = j + 1
+            continue
+
+        # Baris harga murni setelah SKU: "22,000" atau "75,000"
+        if j < len(lines) and re.match(r'^[\d,.]+\s*$', lines[j].strip()):
+            price_money = _extract_money(lines[j])
+            if price_money:
+                line_total = price_money[-1][0]
+                if line_total >= 100 and len(name_clean) >= 2:
+                    items.append(ReceiptItem(
+                        name=name_clean.upper()[:60],
+                        qty=1.0,
+                        unit="",
+                        unit_price=line_total,
+                        line_total=line_total,
+                    ))
+                i = j + 1
+                continue
+
+        i += 1
+    return items
+
+
+
     MRDIY_SKIP = {
         'change', 'cash', 'ppn', 'included', 'total', 'qty', 'item',
         'invoice', 'operator', 'penukaran', 'waktu', 'customer', 'care',
@@ -1671,6 +1801,10 @@ def _parse_receipt_text(text: str) -> OcrResult:
         if keyword in text_lower:
             result.merchant = merchant_name
             break
+
+    # Override khusus: Dineta sering salah karena alamat "Stoa Space" terbaca duluan
+    if 'dineta' in text_lower and result.merchant in (None, 'Stoa Space', ''):
+        result.merchant = 'PT Dineta Jaya'
 
     # Jika tidak ada known merchant, cari dari baris awal
     if not result.merchant:

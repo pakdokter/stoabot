@@ -65,6 +65,7 @@ TOTAL_KEYWORDS = [
     r'\btotal\s+incl\b', r'\btotal\s+include\b',
     r'\btotal\s+termasuk\b', r'\bitem\(s\)\b',
     r'\btotal\s+item\b',  # Alfamart: "Total Item" = total belanja
+    r'\binvoice\s+total\b', r'\bsub\s+total\b',  # Dineta invoice
     # OCR noise variants
     r'\brotal\b', r'\bt0tal\b', r'\bt\*tal\b', r'\btoial\b',
 ]
@@ -824,8 +825,8 @@ def _parse_items_format_mrdiy(lines: list) -> list:
         # SKU: huruf+angka + " - " + angka/angka
         if re.match(r'^[A-Z]{2,}\d+[A-Z0-9]*\s+-\s+\d+/\d+', stripped):
             return True
-        # Batch saja: "12/24  harga" atau "10/189  harga"
-        if re.match(r'^\d+/\d+\s+[\d,]+\s*$', stripped):
+        # Batch saja: "12/24  harga" atau "10/189  harga" (spasi atau tab)
+        if re.match(r'^\d+/\d+[\s\t]+[\d,]+', stripped):
             return True
         return False
 
@@ -875,6 +876,10 @@ def _parse_items_format_mrdiy(lines: list) -> list:
         if not has_alpha or is_sku or is_barcode:
             i += 1
             continue
+        # Skip "1 x 75,000" — qty-harga bukan nama item
+        if re.match(r'^\d+\s+[xX]\s+[\d,]+', line.strip()):
+            i += 1
+            continue
         words = set(re.findall(r'[a-zA-Z]+', line.lower()))
         if words & MRDIY_SKIP:
             i += 1
@@ -886,24 +891,20 @@ def _parse_items_format_mrdiy(lines: list) -> list:
         name_raw = re.sub(r'\t.*', '', line).strip()
         name_clean = name_raw.rstrip('-').strip()
 
-        # Cari harga di baris-baris berikutnya
+        # Cari harga: skip baris SKU, ambil barcode/harga
         j = i + 1
+        sku_price = None
 
-        # Lewati baris SKU/batch
+        # Lewati semua baris SKU, simpan harga dari SKU ter-join
         while j < len(lines) and _is_sku_line(lines[j]):
+            sku_money = _extract_money(lines[j])
+            valid_sku = [v for v, p in sku_money if 100 <= v < 5_000_000]
+            if valid_sku:
+                sku_price = valid_sku[-1]
             j += 1
 
-        # Cek baris berikutnya: barcode, qty-harga, atau harga murni
         if j < len(lines) and _is_barcode_price_line(lines[j]):
             qty, unit_price, line_total = _extract_item_price(lines[j])
-
-            # Jika baris qty tidak punya total (hanya "1 x"), cek baris berikutnya
-            if line_total and line_total < 100 and j + 1 < len(lines):
-                next_money = _extract_money(lines[j + 1])
-                if next_money:
-                    line_total = next_money[-1][0]
-                    j += 1
-
             if line_total and line_total >= 100 and len(name_clean) >= 2:
                 items.append(ReceiptItem(
                     name=name_clean.upper()[:60],
@@ -915,114 +916,27 @@ def _parse_items_format_mrdiy(lines: list) -> list:
             i = j + 1
             continue
 
-        # Baris harga murni setelah SKU: "22,000" atau "75,000"
+        # Baris harga murni: "22,000"
         if j < len(lines) and re.match(r'^[\d,.]+\s*$', lines[j].strip()):
             price_money = _extract_money(lines[j])
             if price_money:
-                line_total = price_money[-1][0]
-                if line_total >= 100 and len(name_clean) >= 2:
+                lt = price_money[-1][0]
+                if lt >= 100 and len(name_clean) >= 2:
                     items.append(ReceiptItem(
-                        name=name_clean.upper()[:60],
-                        qty=1.0,
-                        unit="",
-                        unit_price=line_total,
-                        line_total=line_total,
+                        name=name_clean.upper()[:60], qty=1.0, unit='',
+                        unit_price=lt, line_total=lt,
                     ))
                 i = j + 1
                 continue
 
-        i += 1
-    return items
-
-
-
-    MRDIY_SKIP = {
-        'change', 'cash', 'ppn', 'included', 'total', 'qty', 'item',
-        'invoice', 'operator', 'penukaran', 'waktu', 'customer', 'care',
-        'pesan', 'whatsapp', 'email', 'website', 'yuk', 'bantu',
-        'kualitas', 'pelayanan', 'senin', 'jumat', 'gedung', 'jalan',
-        'jakarta', 'selatan', 'ruko', 'selong', 'pancor',
-    }
-
-    def _is_sku_line(line):
-        """SKU MR DIY: CB023C8025 - 12/24 (kode+angka+dash+angka/angka)."""
-        stripped = line.strip()
-        # SKU murni: huruf+angka diikuti " - " dan "angka/angka"
-        return bool(re.match(r'^[A-Z]{2,}\d+[A-Z0-9]*\s+-\s+\d+/\d+', stripped))
-
-    def _is_barcode_price_line(line):
-        """Baris barcode: dimulai angka 7+ digit (tanpa huruf di depan)."""
-        stripped = line.strip()
-        # Barcode: hanya angka di awal, diikuti spasi/tab dan data lain
-        return bool(re.match(r'^\d{7,}[\s\t]', stripped))
-
-    def _extract_item_price(line):
-        money = _extract_money(line)
-        if not money:
-            return None, None, None
-        # Filter: skip angka yang adalah barcode (7+ digit berurutan di awal baris)
-        barcode_val = None
-        m_bc = re.match(r'^(\d{7,})', line.strip())
-        if m_bc:
-            barcode_val = float(m_bc.group(1).replace(',','').replace('.',''))
-        money = [(v, p) for v, p in money if v != barcode_val]
-        if not money:
-            return None, None, None
-
-        qty_match = re.search(r'(\d{1,3})\s*[xX]\s*(\d)', line)
-        qty = float(qty_match.group(1)) if qty_match else 1.0
-        if len(money) >= 2:
-            unit_price, line_total = money[-2][0], money[-1][0]
-        else:
-            unit_price = line_total = money[-1][0]
-        return qty, unit_price, line_total
-
-    items = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        has_alpha = bool(re.search(r'[A-Za-z]', line))
-        is_sku = _is_sku_line(line)
-        is_barcode = _is_barcode_price_line(line)
-
-        # Skip baris non-item
-        if not has_alpha or is_sku or is_barcode:
-            i += 1
+        # Fallback: harga dari SKU ter-join ("10/189\t22,000\t22,000")
+        if sku_price and sku_price >= 100 and len(name_clean) >= 2:
+            items.append(ReceiptItem(
+                name=name_clean.upper()[:60], qty=1.0, unit='',
+                unit_price=sku_price, line_total=sku_price,
+            ))
+            i = j
             continue
-        words = set(re.findall(r'[a-zA-Z]+', line.lower()))
-        if words & MRDIY_SKIP:
-            i += 1
-            continue
-        if not _is_item_name_line(line):
-            i += 1
-            continue
-
-        name_raw = re.sub(r'\t.*', '', line).strip()
-        name_clean = name_raw.rstrip('-').strip()
-
-        # Cari harga: skip baris SKU, ambil baris barcode
-        j = i + 1
-        if j < len(lines) and _is_sku_line(lines[j]):
-            # Ambil harga satuan dari baris SKU (kolom terakhir)
-            sku_money = _extract_money(lines[j])
-            j += 1
-
-        if j < len(lines) and _is_barcode_price_line(lines[j]):
-            qty, unit_price, line_total = _extract_item_price(lines[j])
-            if line_total and line_total >= 100 and len(name_clean) >= 2:
-                items.append(ReceiptItem(
-                    name=name_clean.upper()[:60],
-                    qty=qty or 1.0,
-                    unit="",
-                    unit_price=unit_price or line_total,
-                    line_total=line_total,
-                ))
-            i = j + 1
-            continue
-
-        # Tidak ada barcode/SKU di baris berikutnya — skip item ini
-        # (MR DIY selalu punya barcode per item; tanpa barcode = bukan item)
-        # Hindari mengambil angka dari nama item sebagai harga
 
         i += 1
     return items
@@ -1181,6 +1095,9 @@ def _normalize_ocr(text: str) -> str:
         # "[unai" → "Tunai"
         cleaned = re.sub(r'^\[unai\b', 'Tunai', cleaned)
 
+        # "236.868,00" → "236868" (invoice: titik=ribuan, koma=desimal)
+        content_tmp = re.sub(r'(\d+)\.(\d{3}),(\d{2})\b', lambda m: str(int(m.group(1))*1000 + int(m.group(2))), cleaned)
+        cleaned = content_tmp
         # "Rp 315. 000" → "Rp 315000" (spasi setelah titik ribuan)
         cleaned = re.sub(r'(Rp\.?\s*\d+)\.\s+(\d{3})\b', r'\1\2', cleaned)
         cleaned = re.sub(r'(\d+)\.\s+(\d{3})\b', r'\1\2', cleaned)
@@ -1794,6 +1711,10 @@ def _parse_receipt_text(text: str) -> OcrResult:
         'dineta': 'PT Dineta Jaya',
         'pt. dineta': 'PT Dineta Jaya',
         'pt dineta': 'PT Dineta Jaya',
+        'daya indah yasa': 'MR D.I.Y.',
+        'pt. daya indah': 'MR D.I.Y.',
+        'pt daya indah': 'MR D.I.Y.',
+        'daya inoan': 'MR D.I.Y.',
     }
 
     text_lower = text.lower()

@@ -1462,6 +1462,82 @@ def _parse_shopee_detail(text: str) -> OcrResult:
 
 
 
+
+def _is_dineta_invoice(text: str) -> bool:
+    """Deteksi invoice PT Dineta Jaya."""
+    return bool(re.search(r'dineta', text, re.IGNORECASE)) and bool(re.search(r'invoice', text, re.IGNORECASE))
+
+
+def _parse_dineta_invoice(text: str) -> OcrResult:
+    """
+    Parse invoice PT Dineta Jaya.
+
+    Format item:
+      12 Pack   1011000103   GF Milk ESL FC IP 1000 Ml @12 *   Rp  19.739,00   Rp  236.868,00
+
+    Total dari:
+      Invoice Total : Rp   236.868,00
+    """
+    from datetime import date as _date
+    result = OcrResult(raw_text=text)
+    result.merchant = "PT Dineta Jaya"
+
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+    # ── Tanggal ──
+    date_m = re.search(r'Date\s*:\s*(\d{1,2}[-/]\w+[-/]\d{2,4})', text, re.IGNORECASE)
+    if date_m:
+        try:
+            from dateutil import parser as dp
+            result.tx_date = dp.parse(date_m.group(1)).date()
+        except Exception:
+            pass
+    if not result.tx_date:
+        result.tx_date = _date.today()
+
+    # ── Total dari Invoice Total ──
+    total_m = re.search(r'Invoice\s+Total\s*:\s*Rp\s*([\d.,]+)', text, re.IGNORECASE)
+    if total_m:
+        raw = total_m.group(1)
+        # Format '236.868,00': titik=pemisah ribuan, koma=desimal
+        clean = re.sub(r'\.(\d{3})', r'\1', raw)  # hapus titik ribuan
+        clean = clean.split(',')[0]  # hapus desimal
+        if clean.isdigit():
+            result.total = float(clean)
+
+    # ── Item dari baris dengan pola QTY UNIT  SKU  NAMA  Rp HARGA  Rp TOTAL ──
+    items = []
+    for line in lines:
+        # Pola: "12 Pack  1011000103  GF Milk ESL FC IP..."
+        m = re.match(r'(\d+)\s+(\w+)\s+(\d{8,})\s+(.+?)\s+Rp\s+([\d.,]+)\s+Rp\s+([\d.,]+)', line)
+        if m:
+            qty = float(m.group(1))
+            desc = m.group(4).strip()
+            # Format "19.739,00": titik=ribuan, koma=desimal
+            def _parse_idr(s):
+                clean = re.sub(r'\.(\d{3})', r'\1', s)
+                clean = clean.split(',')[0]
+                return float(clean) if clean.isdigit() else 0.0
+            raw_unit = m.group(5)
+            raw_total = m.group(6)
+            unit_price = _parse_idr(raw_unit)
+            line_total = _parse_idr(raw_total)
+            if line_total >= 100:
+                items.append(ReceiptItem(
+                    name=desc.upper()[:60],
+                    qty=qty,
+                    unit=m.group(2),
+                    unit_price=unit_price,
+                    line_total=line_total,
+                ))
+
+    result.items = items
+    result.confidence = 0.9 if result.total else 0.5
+    logger.info(f"[OCR] Dineta: items={len(items)} total={result.total}")
+    return result
+
+
+
 def _is_qris_receipt(text: str) -> bool:
     """Deteksi bukti pembayaran QRIS dari bank (BCA, Mandiri, BRI, dll)."""
     indicators = [
@@ -1652,6 +1728,10 @@ def _parse_receipt_text(text: str) -> OcrResult:
     text = _normalize_ocr(text)
 
     # Deteksi format marketplace/app lebih dulu
+    if _is_dineta_invoice(text):
+        logger.info("[OCR] Dineta invoice detected")
+        return _parse_dineta_invoice(text)
+
     if _is_shopee_detail(text):
         logger.info("[OCR] Shopee detail order detected")
         return _parse_shopee_detail(text)

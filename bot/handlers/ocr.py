@@ -70,7 +70,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Notifikasi deteksi toko untuk struk fisik
         if result.merchant and result.confidence >= 0.7:
             await update.message.reply_text(
-                f"🏪 Struk ini terdeteksi sebagai struk *{result.merchant}*",
+                f"🏪 Struk ini terdeteksi sebagai struk *{_esc(result.merchant)}*",
                 parse_mode="Markdown",
             )
 
@@ -248,7 +248,8 @@ async def _show_ocr_result(update: Update, result: OcrResult):
         lines.append("\n🛒 *Item:*")
         for item in result.items:
             qty_str = f"({int(item.qty)}x) " if item.qty > 1 else ""
-            lines.append(f"  • {item.name} {qty_str}— *{fmt_rupiah(item.line_total)}*")
+            safe_name = _esc(item.name)
+            lines.append(f"  • {safe_name} {qty_str}— *{fmt_rupiah(item.line_total)}*")
         lines.append(f"\nTotal Item: *{len(result.items)}*")
     else:
         lines.append("\n_Item tidak terdeteksi_")

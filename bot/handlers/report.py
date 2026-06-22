@@ -1,3 +1,4 @@
+import re
 """
 Report handlers:
   /laporan  — pilihan periode: hari ini, minggu ini, bulan ini, atau rentang tanggal
@@ -49,10 +50,11 @@ async def cmd_ringkas(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     db_user = context.user_data.get("db_user")
     user_name = db_user.full_name if db_user else update.effective_user.full_name or "User"
+    user_name_safe = re.sub(r'([_*])', r'\\\1', user_name)
 
     await update.message.reply_text(
         f"📊 *Ringkasan Laporan Keuangan*\n"
-        f"👤 {user_name}\n"
+        f"👤 {user_name_safe}\n" 
         f"_{fmt_date_full(first_day)} — {fmt_date_full(today)}_\n\n"
         f"Pemasukan:\n*{fmt_rupiah(summary['total_masuk'])}*\n\n"
         f"Pengeluaran:\n*{fmt_rupiah(summary['total_keluar'])}*\n\n"
@@ -182,6 +184,7 @@ async def _show_laporan(update_or_query, user_id: int, date_from: date, date_to:
     async with _ASL() as _s:
         _u = await _s.get(_User, user_id)
         user_name = _u.full_name if _u else str(user_id)
+    user_name_safe = re.sub(r'([_*])', r'\\\1', user_name)
 
     # Label periode
     if date_from == date_to:
@@ -191,7 +194,7 @@ async def _show_laporan(update_or_query, user_id: int, date_from: date, date_to:
 
     lines = [
         f"📊 *Laporan Transaksi*\n"
-        f"👤 {user_name}\n"
+        f"👤 {user_name_safe}\n"
         f"{periode}\n",
         f"Total Masuk: *{fmt_rupiah(summary['total_masuk'])}*",
         f"Total Keluar: *{fmt_rupiah(summary['total_keluar'])}*",

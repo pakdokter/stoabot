@@ -1463,6 +1463,138 @@ def _parse_shopee_detail(text: str) -> OcrResult:
 
 
 
+
+def _is_tiktok_order(text: str) -> bool:
+    """Deteksi screenshot pesanan TikTok Shop."""
+    indicators = [
+        r'pesanan\s+dibuat',
+        r'tiba\s+pada',
+        r'batalkan\s+pesanan',
+        r'nomor\s+pesanan',
+        r'hubungi\s+penjual',
+        r'pengembalian\s+barang\s+gratis',
+    ]
+    text_lower = text.lower()
+    hits = sum(1 for p in indicators if re.search(p, text_lower))
+    # TikTok tidak punya "Subtotal Produk" (itu Shopee)
+    not_shopee = not re.search(r'subtotal\s+produk', text_lower)
+    return hits >= 3 and not_shopee
+
+
+def _parse_tiktok_order(text: str) -> OcrResult:
+    """
+    Parse screenshot pesanan TikTok Shop.
+
+    Format:
+      COLOOMP >
+      Pre-order  Coloomp- Yasmine Atasan...   Rp105.588
+      NAVY BLUE, XXXL                         x15
+      Nomor pesanan  584640034955953432
+      BCA Bank Central Asia   Total: Rp1.408.330
+    """
+    from datetime import date as _date
+    from bot.utils.formatters import fmt_rupiah
+    result = OcrResult(raw_text=text)
+    result.tx_date = _date.today()
+    result.is_shopee_detail = True  # reuse Shopee detail flow
+
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+    # ── Merchant/Toko penjual ──
+    merchant = None
+    # Cari nama toko dari raw_text (sebelum unicode di-strip)
+    for raw_line in result.raw_text.splitlines():
+        raw_line = raw_line.strip()
+        if re.search(r'[\u203a\u2192>\u203e]\s*\t*$', raw_line):
+            candidate = re.sub(r'[\u203a\u2192>\u203e\t]+\s*$', '', raw_line).strip()
+            if (2 <= len(candidate) <= 40 and
+                not re.search(r'ubah|hubungi|pengembalian|pesanan|penjual|support|cari', candidate, re.IGNORECASE)):
+                merchant = candidate
+                break
+
+    result.merchant = f"TikTok - {merchant}" if merchant else "TikTok Shop"
+
+    # ── Total ──
+    total_m = re.search(r'Total:\s*Rp([\d.,]+)', text, re.IGNORECASE)
+    if total_m:
+        raw = total_m.group(1)
+        clean = re.sub(r'\.(\d{3})', r'\1', raw).split(',')[0]
+        if clean.isdigit():
+            result.total = float(clean)
+
+    # ── Items ──
+    # Pola: baris nama item + harga, baris berikutnya variant + qty
+    items = []
+    SKIP = re.compile(r'pesanan|tiba|sedang|transit|diantarkan|kurir|ubah|batalkan|'
+                      r'hubungi|pengembalian|nomor|bank|total|bonus|voucher|pesan|'
+                      r'beli|lokal|paylat|whatsapp|support', re.IGNORECASE)
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if SKIP.search(line):
+            i += 1
+            continue
+
+        # Baris item: mengandung "Pre-order" atau langsung nama + Rp
+        price_m = re.search(r'Rp([\d.,]+)\s*$', line)
+        if price_m:
+            raw = price_m.group(1)
+            clean = re.sub(r'\.(\d{3})', r'\1', raw).split(',')[0]
+            price = float(clean) if clean.isdigit() else 0.0
+
+            # Bersihkan nama dari "Pre-order" label
+            name = re.sub(r'^Pre-order\s*', '', line, flags=re.IGNORECASE)
+            name = re.sub(r'\s*Rp[\d.,]+\s*$', '', name).strip()
+            name = re.sub(r'\.{3}\s*$', '', name).strip()
+
+            # Cari qty di baris berikutnya (variant + xN)
+            qty = 1.0
+            if i + 1 < len(lines):
+                next_line = lines[i+1]
+                qty_m = re.search(r'x(\d+)\s*$', next_line)
+                if qty_m:
+                    qty = float(qty_m.group(1))
+                    i += 1
+
+            if name and len(name) >= 3 and price >= 100:
+                line_total = price * qty
+                items.append(ReceiptItem(
+                    name=name.upper()[:60],
+                    qty=qty,
+                    unit="",
+                    unit_price=price,
+                    line_total=line_total,
+                ))
+
+        i += 1
+
+    result.items = items
+
+    # ── Summary ──
+    from bot.utils.formatters import fmt_rupiah
+    summary_lines = [f"Terdeteksi pesanan TikTok Shop"]
+    summary_lines.append(f"Toko: {result.merchant}")
+    for item in items:
+        qty_str = f" x{int(item.qty)}" if item.qty > 1 else ""
+        summary_lines.append(f"  - {item.name}{qty_str} -- {fmt_rupiah(item.unit_price)}/item")
+    if result.total:
+        summary_lines.append(f"Total: {fmt_rupiah(result.total)}")
+
+    result.shopee_summary = "\n".join(summary_lines)
+    result.shopee_item = items[0].name if items else "Item TikTok"
+    result.shopee_qty = int(items[0].qty) if items else 1
+
+    score = 0.3
+    score += 0.4 if result.total else 0.0
+    score += 0.3 if items else 0.0
+    result.confidence = round(score, 2)
+
+    logger.info(f"[OCR] TikTok: merchant={result.merchant!r} items={len(items)} total={result.total}")
+    return result
+
+
+
 def _is_dineta_invoice(text: str) -> bool:
     """Deteksi invoice PT Dineta Jaya."""
     return bool(re.search(r'dineta', text, re.IGNORECASE)) and bool(re.search(r'invoice', text, re.IGNORECASE))
@@ -1724,13 +1856,31 @@ def _parse_shopee_orders(text: str) -> OcrResult:
 
 
 def _parse_receipt_text(text: str) -> OcrResult:
-    # Normalisasi dulu sebelum parsing
+    # Simpan original sebelum normalize (untuk deteksi unicode seperti ›)
+    original_text = text
     text = _normalize_ocr(text)
 
     # Deteksi format marketplace/app lebih dulu
     if _is_dineta_invoice(text):
         logger.info("[OCR] Dineta invoice detected")
         return _parse_dineta_invoice(text)
+
+    if _is_tiktok_order(text):
+        logger.info("[OCR] TikTok Shop order detected")
+        result = _parse_tiktok_order(text)
+        # Override merchant dari original text (unicode ›)
+        if result.merchant == "TikTok Shop":
+            for raw_line in original_text.splitlines():
+                raw_line = raw_line.strip()
+                if re.search(r'[\u203a\u2192>\u203e]\s*\t*$', raw_line):
+                    cand = re.sub(r'[\u203a\u2192>\u203e\t]+\s*$', '', raw_line).strip()
+                    if (2 <= len(cand) <= 40 and
+                        not re.search(r'ubah|hubungi|pengembalian|pesanan|penjual|support|cari', cand, re.IGNORECASE)):
+                        result.merchant = f"TikTok - {cand}"
+                        if result.shopee_summary:
+                            result.shopee_summary = result.shopee_summary.replace("TikTok Shop", result.merchant)
+                        break
+        return result
 
     if _is_shopee_detail(text):
         logger.info("[OCR] Shopee detail order detected")

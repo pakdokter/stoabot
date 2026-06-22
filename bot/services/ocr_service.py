@@ -1,5 +1,5 @@
 """
-OCR Service — parser struk belanja dari berbagai toko.
+OCR Service - parser struk belanja dari berbagai toko.
 
 Format struk fisik:
   Format A : nama item multi-baris, detail di baris berikutnya
@@ -10,12 +10,20 @@ Format struk fisik:
              (Fadhilah Frozen Foods)
   Format D : nama item, lalu SKU-batch + harga, lalu barcode + qty + total
              (MR D.I.Y.)
+  Format E : Format B dengan Disc. per item di baris terpisah
+             (Alfamart Selebung, varian dengan diskon per item)
+  Format F : nama item, lalu "Nx HARGA TOTAL"
+             (Harnila Store, kasir app generic)
+  Format G : invoice tabel kolom, format IDR titik-koma (NNN.NNN,00)
+             (PT Dineta Jaya, supplier/distributor dengan invoice formal)
 
 Screenshot app:
-  Shopee Pesanan Saya     — per separator toko
-  Shopee Rincian Pesanan  — per item + biaya tambahan
-  Sukanda Jaya            — Harga Satuan + Total per item
-  QRIS BCA                — form input manual
+  Shopee Pesanan Saya     - per separator toko (Selesai/Dikirim)
+  Shopee Rincian Pesanan  - per item + biaya tambahan, total pesanan
+  Sukanda Jaya            - Harga Satuan + Total per item, SKU angka
+  TikTok Shop             - Pesanan dibuat, nama toko, item x qty, total BCA
+  QRIS BCA                - Payment Successful, form input manual toko/item
+  PT Dineta Jaya (G)      - Invoice formal, kolom Qty-Desc-UnitPrice-Amount
 """
 import re
 import httpx

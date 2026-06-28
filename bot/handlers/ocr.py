@@ -20,6 +20,10 @@ from bot.services.audit import log_create
 from bot.utils.formatters import fmt_rupiah, fmt_date, parse_amount
 from bot.handlers.auth import ensure_registered
 
+def _esc(text: str) -> str:
+    """Escape karakter Markdown agar tidak break pesan Telegram."""
+    return str(text).replace('_', '\\_').replace('*', '\\*').replace('`', '\\`').replace('[', '\\[')
+
 OCR_KONFIRMASI    = 50
 OCR_EDIT_NOMINAL  = 51
 OCR_EDIT_MENU     = 52

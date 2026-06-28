@@ -240,7 +240,7 @@ async def qris_input_total(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _show_ocr_result(update: Update, result: OcrResult):
     """Tampilkan hasil OCR dengan rincian item."""
     lines = ["📄 *Hasil Baca Struk*\n"]
-    lines.append(f"Toko: *{result.merchant or 'tidak terdeteksi'}*")
+    lines.append(f"Toko: *{_esc(result.merchant or 'tidak terdeteksi')}*")
 
     if result.tx_date:
         lines.append(f"Tanggal: *{fmt_date(result.tx_date)}*")
@@ -505,7 +505,7 @@ async def ocr_edit_nominal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("🛒 *Item:*")
         for item in result.items:
             qty_str = f"({int(item.qty)}x) " if item.qty > 1 else ""
-            lines.append(f"  • {item.name} {qty_str}— *{fmt_rupiah(item.line_total)}*")
+            lines.append(f"  • {_esc(item.name)} {qty_str}— *{fmt_rupiah(item.line_total)}*")
         lines.append(f"\nTotal Item: *{len(result.items)}*")
     lines.append(f"Toko: *{merchant}*")
     lines.append(f"Tanggal: *{fmt_date(tx_date)}*")
@@ -597,7 +597,7 @@ async def _do_save(update_or_query, context, user_id, from_query):
             lines.append("🛒 *Rincian (per item):*")
             for item in result.items:
                 qty_str = f"({int(item.qty)}x) " if item.qty > 1 else ""
-                lines.append(f"  • {item.name} {qty_str}— {fmt_rupiah(item.line_total)}")
+                lines.append(f"  • {_esc(item.name)} {qty_str}— {fmt_rupiah(item.line_total)}")
             lines.append(f"\nTotal Item: *{len(result.items)}*")
         lines.append(f"Jenis: ➖ KELUAR")
         lines.append(f"Total Belanja: *{fmt_rupiah(amount)}*")
@@ -611,8 +611,11 @@ async def _do_save(update_or_query, context, user_id, from_query):
             else: await update_or_query.message.reply_text(msg, parse_mode="Markdown")
         except Exception as e:
             logger.error(f"[OCR] reply after save failed: {e}")
+            # Fallback: kirim tanpa Markdown
+            msg_plain = msg.replace('*', '').replace('_', '').replace('`', '')
             try:
-                if from_query: await update_or_query.message.reply_text(msg, parse_mode="Markdown")
+                if from_query: await update_or_query.message.reply_text(msg_plain)
+                else: await update_or_query.message.reply_text(msg_plain)
             except Exception: pass
 
     except Exception as e:

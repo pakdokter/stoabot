@@ -157,6 +157,11 @@ SKIP_LINE_PATTERNS = [
     r'\bcpm\s+qris\b',                       # CPM QRIS (payment method)
     r'^disc\.?\s*[-+]?[\d.,]+',              # "Disc. -1.000" per item bukan item
     r'\bken?balian\b',                        # kembalian/kenbalian
+    r'^\d{1,2}/\d{2}/\d{4}',                 # tanggal DD/MM/YYYY (Amanah header)
+    r'^SI\d+-\d+',                            # nomor struk Amanah "SI01-2606-4786"
+    r'^\d{2}-\w{3}-\d{2,4}',                 # tanggal "17-Jun-26" footer struk
+    r'\bkasir\s*:',                           # "Kasir : ADMIN"
+    r'^instagram\s*:', r'^facebook\s*:',      # social media footer Amanah
     r'\bsms/wa\b',                            # SMS/WA
     r'^-?(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|'
     r'januari|februari|maret|april|mei|juni|juli|agustus|'

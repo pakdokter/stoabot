@@ -71,6 +71,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if result.is_qris:
             return await handle_qris_result(update, context, result)
 
+        # Bukti transfer bank → tolak dengan pesan jelas
+        if getattr(result, '_is_bank_transfer', False):
+            await update.message.reply_text(
+                "⚠️ Ini terdeteksi sebagai *bukti transfer bank*, bukan struk belanja.\n\n"
+                "Untuk catat transfer masuk/keluar, gunakan:\n"
+                "  /masuk atau /keluar\n"
+                "lalu isi nominal dan keterangan secara manual.",
+                parse_mode="Markdown",
+            )
+            return ConversationHandler.END
+
         # Notifikasi deteksi toko untuk struk fisik
         if result.merchant and result.confidence >= 0.7:
             await update.message.reply_text(

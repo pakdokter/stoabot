@@ -29,7 +29,8 @@ from bot.handlers.auth import ensure_registered
     LAPORAN_MENU,
     LAPORAN_FROM, LAPORAN_TO,
     STMT_BULAN, STMT_TAHUN,
-) = range(5)
+    LPTEKS_INPUT,
+) = range(6)
 
 
 # ── /ringkas ──────────────────────────────────────────────────────────
@@ -630,3 +631,222 @@ async def handle_lpteks_callback(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as e:
         logger.exception(f"[LPTEKS] save error: {e}")
         await query.edit_message_text(f"❌ Error: {e}")
+
+
+
+
+# ── /laporan_teks — parser laporan belanja harian teks staff ──────────────────
+
+def _esc_md(t: str) -> str:
+    return str(t).replace('_', r'\_').replace('*', r'\*').replace('`', r'\`').replace('[', r'\[')
+
+
+async def cmd_laporan_teks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/laporan_teks — entry point, minta user paste laporan."""
+    if not await ensure_registered(update, context):
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "📋 *Rekap Laporan Teks*\n\n"
+        "Paste laporan belanja harianmu di pesan berikutnya.\n\n"
+        "Format yang diterima:\n"
+        "`*10 Juni`\n"
+        "`• Uang masuk - 1.000.000`\n"
+        "`• Dinda - 185.000`\n"
+        "`• Belanja Pasar`\n"
+        "`-Tomat 1kg - 8.000`\n"
+        "`=8.000`\n\n"
+        "Atau ketik /batal untuk keluar.",
+        parse_mode="Markdown",
+    )
+    return LPTEKS_INPUT
+
+
+async def handle_lpteks_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Terima teks laporan, parse, tampilkan preview."""
+    from bot.services.report_parser import parse_report_text
+
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("❌ Teks kosong. Coba lagi atau /batal.")
+        return LPTEKS_INPUT
+
+    result = parse_report_text(text)
+
+    if not result.transactions:
+        msg = "❌ Tidak ada transaksi yang bisa dibaca.\n\n"
+        if result.errors:
+            msg += "Baris bermasalah:\n"
+            for e in result.errors[:5]:
+                msg += f"  • {e}\n"
+        msg += "\nCoba lagi atau /batal."
+        await update.message.reply_text(msg)
+        return LPTEKS_INPUT
+
+    # Preview
+    lines = [f"📋 *Preview* ({len(result.transactions)} transaksi)\n"]
+    current_date = None
+    for tx in result.transactions:
+        if tx.tx_date != current_date:
+            current_date = tx.tx_date
+            lines.append(f"\n📅 *{fmt_date(tx.tx_date)}*")
+        sym = "➕" if tx.tx_type == 'masuk' else "➖"
+        lines.append(f"  {sym} {_esc_md(tx.description)} — *{fmt_rupiah(tx.amount)}*")
+
+    lines.append(f"\n💰 Masuk : *{fmt_rupiah(result.total_masuk)}*")
+    lines.append(f"💸 Keluar: *{fmt_rupiah(result.total_keluar)}*")
+
+    if result.errors:
+        lines.append(f"\n⚠️ {len(result.errors)} baris tidak terbaca:")
+        for e in result.errors[:3]:
+            lines.append(f"  • {_esc_md(e)}")
+
+    if result.skipped_days:
+        lines.append(f"\n📌 {len(result.skipped_days)} hari tidak belanja")
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Simpan semua", callback_data="lpteks:simpan"),
+        InlineKeyboardButton("✏️ Ulangi", callback_data="lpteks:ulangi"),
+        InlineKeyboardButton("❌ Batal", callback_data="lpteks:batal"),
+    ]])
+
+    context.user_data["lpteks_result"] = result
+    context.user_data["lpteks_user_id"] = update.effective_user.id
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+    return LPTEKS_INPUT
+
+
+async def handle_lpteks_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle konfirmasi simpan/ulangi/batal."""
+    from bot.services.report_parser import ParseResult
+    from bot.models import Transaction, MarketItem
+    from bot.services.balance import get_running_balance
+    from bot.services.sheets import append_transaction as sheets_append
+    from bot.services.audit import log_create
+    from sqlalchemy import func as sqlfunc, select
+
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "lpteks:batal":
+        await query.edit_message_text("❌ Dibatalkan.")
+        return ConversationHandler.END
+
+    if data == "lpteks:ulangi":
+        await query.edit_message_text(
+            "✏️ Paste ulang laporan belanjamu:"
+        )
+        return LPTEKS_INPUT
+
+    if data != "lpteks:simpan":
+        return LPTEKS_INPUT
+
+    result: ParseResult = context.user_data.get("lpteks_result")
+    user_id: int = context.user_data.get("lpteks_user_id", update.effective_user.id)
+
+    if not result or not result.transactions:
+        await query.edit_message_text("❌ Data tidak ditemukan. Kirim ulang /laporan_teks.")
+        return ConversationHandler.END
+
+    await query.edit_message_text("⏳ Menyimpan...")
+
+    saved = 0
+    failed = 0
+
+    try:
+        async with AsyncSessionLocal() as session:
+            for tx_data in result.transactions:
+                try:
+                    tx = Transaction(
+                        user_id=user_id,
+                        type=tx_data.tx_type,
+                        amount=tx_data.amount,
+                        description=tx_data.description[:200],
+                        category=tx_data.category or None,
+                        transaction_date=tx_data.tx_date,
+                    )
+                    session.add(tx)
+                    await session.flush()
+                    await log_create(session, user_id, tx)
+
+                    # Update katalog market_items jika pasar
+                    if tx_data.category == 'pasar':
+                        item_name = re.sub(r'^Pasar\s*-\s*', '', tx_data.description).strip()
+                        existing = await session.execute(
+                            select(MarketItem).where(
+                                sqlfunc.lower(MarketItem.name) == item_name.lower()
+                            )
+                        )
+                        cat_item = existing.scalar_one_or_none()
+                        if cat_item:
+                            cat_item.use_count += 1
+                            cat_item.last_price = tx_data.amount
+                            cat_item.last_used = tx_data.tx_date
+                        else:
+                            session.add(MarketItem(
+                                name=item_name.title(),
+                                last_price=tx_data.amount,
+                                use_count=1,
+                                last_used=tx_data.tx_date,
+                            ))
+
+                    saved += 1
+                except Exception as e:
+                    logger.error(f"[LPTEKS] tx failed: {e}")
+                    failed += 1
+
+            await session.commit()
+            saldo = await get_running_balance(session, user_id)
+
+        # Google Sheets
+        for tx_data in result.transactions:
+            try:
+                await sheets_append(
+                    user_id=user_id,
+                    user_name=update.effective_user.full_name or "",
+                    tx_type=tx_data.tx_type,
+                    amount=tx_data.amount,
+                    description=tx_data.description,
+                    tx_date=tx_data.tx_date,
+                )
+            except Exception as e:
+                logger.warning(f"[LPTEKS] sheets: {e}")
+
+        msg = (
+            f"✅ *{saved} transaksi tersimpan*"
+            + (f"\n❌ {failed} gagal" if failed else "")
+            + f"\n\n💰 Masuk : *{fmt_rupiah(result.total_masuk)}*"
+            + f"\n💸 Keluar: *{fmt_rupiah(result.total_keluar)}*"
+            + f"\n\n💳 Saldo: *{fmt_rupiah(saldo)}*"
+        )
+        try:
+            await query.edit_message_text(msg, parse_mode="Markdown")
+        except Exception:
+            await query.message.reply_text(msg.replace('*', '').replace('_', ''))
+
+    except Exception as e:
+        logger.exception(f"[LPTEKS] save error: {e}")
+        await query.edit_message_text(f"❌ Error: {e}")
+
+    return ConversationHandler.END
+
+
+def build_laporan_teks_conv() -> ConversationHandler:
+    return ConversationHandler(
+        entry_points=[CommandHandler("laporan_teks", cmd_laporan_teks)],
+        states={
+            LPTEKS_INPUT: [
+                CallbackQueryHandler(handle_lpteks_callback, pattern="^lpteks:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_lpteks_input),
+            ],
+        },
+        fallbacks=[CommandHandler("batal", lambda u, c: ConversationHandler.END)],
+        allow_reentry=True,
+        conversation_timeout=600,
+    )

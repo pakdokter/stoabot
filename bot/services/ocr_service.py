@@ -32,7 +32,14 @@ Screenshot app:
 
 Ditolak (bukan struk belanja):
   Transfer BCA/bank       - Transfer Successful, Beneficiary Name, Reference No.
-                            → bot reply dengan panduan /masuk atau /keluar manual
+                            NAMUN jika ada Remarks berisi keterangan barang (angka,
+                            satuan kg/gr/pcs, kata pickup/order dll), diperlakukan
+                            sebagai belanja via transfer BCA:
+                              merchant = Beneficiary Name
+                              item     = isi Remarks
+                              total    = Transfer Amount (IDR NNN,NNN.00)
+                            Jika Remarks kosong atau hanya nama/transfer biasa,
+                            ditolak dan bot minta input manual /masuk atau /keluar
 
 Format laporan teks (cmd /laporan_teks, bukan foto):
   Laporan harian staff    - *TGL\\n• TOKO - NOMINAL\\n(TOTAL)
@@ -1493,7 +1500,7 @@ def _parse_shopee_detail(text: str) -> OcrResult:
 
 
 def _is_bank_transfer(text: str) -> bool:
-    """Deteksi screenshot bukti transfer bank — bukan struk belanja."""
+    """Deteksi screenshot bukti transfer bank BCA."""
     text_lower = text.lower()
     indicators = [
         r'transfer\s+successful',
@@ -1508,6 +1515,120 @@ def _is_bank_transfer(text: str) -> bool:
     ]
     hits = sum(1 for p in indicators if re.search(p, text_lower))
     return hits >= 3
+
+
+def _try_parse_bca_transfer_belanja(text: str) -> 'OcrResult | None':
+    """
+    Parse transfer BCA sebagai belanja jika ada Remarks berisi keterangan barang.
+
+    Format BCA Transfer:
+      Transfer Successful
+      Beneficiary Name   RAUCHSAN ABDI AKBAR
+      Transfer Amount    IDR 850,000.00
+      Remarks            lucy 5 kg pickup 30 juni
+
+    Logika:
+    - Jika Remarks ada dan berisi kata yang terlihat seperti item/barang, parse sebagai belanja
+    - Merchant = Beneficiary Name (nama penerima)
+    - Amount = Transfer Amount
+    - Item = isi Remarks
+    - Jika Remarks kosong atau tidak ada, return None (tolak)
+    """
+    from datetime import date as _date
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    text_lower = text.lower()
+
+    # Ambil Remarks
+    remarks = None
+    for i, line in enumerate(lines):
+        if re.search(r'^remarks\b', line, re.IGNORECASE):
+            # Remarks bisa di kolom kanan dari tab
+            parts = re.split(r'\t+', line, maxsplit=1)
+            if len(parts) > 1:
+                remarks = parts[1].strip()
+            elif i + 1 < len(lines):
+                remarks = lines[i + 1].strip()
+            break
+
+    # Tidak ada remarks atau remarks kosong = transfer biasa, tolak
+    if not remarks:
+        return None
+
+    # Remarks yang terlihat seperti keterangan barang/belanja
+    # Bukan: "payment", "hutang", nama orang saja, nomor saja
+    STOP_REMARKS = re.compile(
+        r'^(transfer|bayar|hutang|cicil|angsuran|gaji|salary|'
+        r'[a-z\s]{1,20}$)',  # hanya nama/kata pendek tanpa angka = bukan item
+        re.IGNORECASE
+    )
+    has_product_clue = bool(re.search(
+        r'\d|kg|gr|gram|liter|lt|pcs|pack|ikat|ekor|buah|dus|karton|'
+        r'pickup|ambil|beli|order|pesanan',
+        remarks, re.IGNORECASE
+    ))
+
+    if not has_product_clue:
+        return None  # Remarks ada tapi tidak terlihat seperti item belanja
+
+    # Ambil Transfer Amount
+    amount = None
+    for line in lines:
+        if re.search(r'transfer\s+amount', line, re.IGNORECASE):
+            m = re.search(r'IDR\s+([\d,]+(?:\.\d{2})?)', line, re.IGNORECASE)
+            if m:
+                raw = m.group(1).replace(',', '').split('.')[0]
+                if raw.isdigit():
+                    amount = float(raw)
+            break
+
+    if not amount or amount <= 0:
+        return None
+
+    # Ambil Beneficiary Name sebagai merchant
+    merchant = None
+    for line in lines:
+        if re.search(r'beneficiary\s+name', line, re.IGNORECASE):
+            parts = re.split(r'\t+', line, maxsplit=1)
+            if len(parts) > 1:
+                merchant = parts[1].strip().title()
+            break
+    if not merchant:
+        merchant = "Transfer BCA"
+
+    # Ambil tanggal dari baris tanggal
+    tx_date = _date.today()
+    for line in lines:
+        m = re.match(r'(\d{1,2})\s+(\w+)\s+(\d{4})', line)
+        if m:
+            try:
+                from dateutil import parser as dp
+                tx_date = dp.parse(line[:20]).date()
+                break
+            except Exception:
+                pass
+
+    # Buat OcrResult
+    result = OcrResult(raw_text=text)
+    result.merchant = merchant
+    result.total = amount
+    result.tx_date = tx_date
+    result.confidence = 0.85
+
+    # Item dari remarks
+    item_name = remarks.strip().title()
+    result.items = [ReceiptItem(
+        name=item_name[:60],
+        qty=1.0,
+        unit="",
+        unit_price=amount,
+        line_total=amount,
+    )]
+
+    logger.info(
+        f"[OCR] BCA transfer as belanja: merchant={merchant!r} "
+        f"amount={amount} item={item_name!r}"
+    )
+    return result
 
 
 
@@ -1912,14 +2033,19 @@ def _parse_receipt_text(text: str) -> OcrResult:
         logger.info("[OCR] Dineta invoice detected")
         return _parse_dineta_invoice(text)
 
-    # Tolak bukti transfer bank (bukan struk belanja)
+    # Deteksi transfer BCA — bedakan transfer biasa vs pembayaran belanja
     if _is_bank_transfer(text):
-        logger.info("[OCR] Bank transfer screenshot — bukan struk belanja")
-        result = OcrResult(raw_text=text)
-        result.merchant = None
-        result.confidence = 0.0
-        result._is_bank_transfer = True
-        return result
+        belanja = _try_parse_bca_transfer_belanja(text)
+        if belanja:
+            logger.info(f"[OCR] BCA transfer belanja: merchant={belanja.merchant!r} amount={belanja.total}")
+            return belanja
+        else:
+            logger.info("[OCR] Bank transfer screenshot — bukan struk belanja")
+            result = OcrResult(raw_text=text)
+            result.merchant = None
+            result.confidence = 0.0
+            result._is_bank_transfer = True
+            return result
 
     if _is_tiktok_order(text):
         logger.info("[OCR] TikTok Shop order detected")

@@ -24,7 +24,7 @@ from bot.handlers.transaction import (
     cmd_saldo, cmd_riwayat, cmd_cari,
     build_transaction_conv, build_edit_conv, build_hapus_conv,
 )
-from bot.handlers.report import cmd_ringkas, build_laporan_conv, build_statement_conv
+from bot.handlers.report import cmd_ringkas, build_laporan_conv, build_statement_conv, cmd_laporan_teks, handle_lpteks_callback
 from bot.handlers.ocr import build_ocr_conv
 
 
@@ -144,6 +144,8 @@ def create_app() -> Application:
     app.add_handler(CommandHandler("saldo", cmd_saldo))
     app.add_handler(CommandHandler("riwayat", cmd_riwayat))
     app.add_handler(CommandHandler("ringkas", cmd_ringkas))
+    app.add_handler(CommandHandler("laporan_teks", cmd_laporan_teks))
+    app.add_handler(CallbackQueryHandler(handle_lpteks_callback, pattern="^lpteks:"))
     app.add_handler(CommandHandler("cari", cmd_cari))
     # Auth commands
     app.add_handler(build_login_conv())

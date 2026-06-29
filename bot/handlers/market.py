@@ -382,9 +382,7 @@ async def _simpan_pasar(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     session.add(catalog_item)
 
-                await log_create(session, user_id, "transactions", tx.id, {
-                    "type": "keluar", "amount": item["total"], "description": desc,
-                })
+                await log_create(session, user_id, tx)
                 saved_ids.append(tx.id)
                 total_all += item["total"]
 

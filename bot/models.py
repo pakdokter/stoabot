@@ -75,3 +75,17 @@ class AuditLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     user: Mapped["User"] = relationship(back_populates="audit_logs")
+
+
+class MarketItem(Base):
+    """Katalog nama item pasar — diupdate otomatis setiap transaksi pasar baru."""
+    __tablename__ = "market_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)  # nama item, unik
+    unit: Mapped[Optional[str]] = mapped_column(String(32))                      # kg, pcs, ikat, dll
+    last_price: Mapped[Optional[float]] = mapped_column(Numeric(15, 2))          # harga terakhir dipakai
+    use_count: Mapped[int] = mapped_column(BigInteger, default=1)                # berapa kali dipakai
+    last_used: Mapped[Optional[date]] = mapped_column(Date)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

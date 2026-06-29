@@ -419,3 +419,214 @@ def build_statement_conv() -> ConversationHandler:
         allow_reentry=True,
         conversation_timeout=300,
     )
+
+
+# ── /laporan_teks — parser laporan belanja harian teks staff ──────────────────
+
+async def cmd_laporan_teks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /laporan_teks — kirim laporan belanja harian format teks, bot parse dan simpan.
+
+    Format yang diterima:
+      *DD Bulan
+      • Toko - Nominal
+      • Uang Masuk - Nominal
+      • Belanja Pasar
+      -item - harga
+      =total
+      (total_harian)
+    """
+    from bot.services.report_parser import parse_report_text
+    from bot.models import Transaction, MarketItem
+    from bot.services.balance import get_running_balance
+    from bot.services.sheets import append_transaction as sheets_append
+    from bot.services.audit import log_create
+    import re
+
+    if not await ensure_registered(update, context):
+        return
+
+    user_id = update.effective_user.id
+
+    # Ambil teks dari pesan (setelah /laporan_teks)
+    text = update.message.text or ""
+    # Hapus command prefix
+    text = re.sub(r'^/laporan_teks\s*', '', text, flags=re.IGNORECASE).strip()
+
+    if not text:
+        await update.message.reply_text(
+            "📋 *Cara pakai /laporan\\_teks*\n\n"
+            "Kirim laporan belanja harian langsung setelah command:\n\n"
+            "`/laporan_teks`\n"
+            "`*10 Juni`\n"
+            "`• Uang masuk - 1.000.000`\n"
+            "`• Dinda - 185.000`\n"
+            "`• Belanja Pasar`\n"
+            "`-Tomat 1kg - 8.000`\n"
+            "`=8.000`\n\n"
+            "Bot akan parse dan simpan semua transaksi sekaligus.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Parse
+    result = parse_report_text(text)
+
+    if not result.transactions:
+        msg = "❌ Tidak ada transaksi yang bisa dibaca.\n\n"
+        if result.errors:
+            msg += "Baris bermasalah:\n"
+            for e in result.errors[:5]:
+                msg += f"  • {e}\n"
+        await update.message.reply_text(msg)
+        return
+
+    # Preview dulu sebelum simpan
+    from bot.utils.formatters import fmt_rupiah, fmt_date
+
+    def _esc_local(t): return str(t).replace('_', r'\_').replace('*', r'\*')
+
+    lines = [f"📋 *Preview Laporan* ({len(result.transactions)} transaksi)\n"]
+
+    current_date = None
+    for tx in result.transactions:
+        if tx.tx_date != current_date:
+            current_date = tx.tx_date
+            lines.append(f"\n📅 *{fmt_date(tx.tx_date)}*")
+        sym = "➕" if tx.tx_type == 'masuk' else "➖"
+        lines.append(f"  {sym} {_esc_local(tx.description)} — *{fmt_rupiah(tx.amount)}*")
+
+    lines.append(f"\n💰 Total masuk : *{fmt_rupiah(result.total_masuk)}*")
+    lines.append(f"💸 Total keluar: *{fmt_rupiah(result.total_keluar)}*")
+
+    if result.errors:
+        lines.append(f"\n⚠️ {len(result.errors)} baris tidak terbaca:")
+        for e in result.errors[:3]:
+            lines.append(f"  • {_esc_local(e)}")
+
+    if result.skipped_days:
+        lines.append(f"\n📌 Hari tidak belanja: {len(result.skipped_days)} hari")
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Simpan semua", callback_data="lpteks:simpan"),
+        InlineKeyboardButton("❌ Batal", callback_data="lpteks:batal"),
+    ]])
+
+    # Simpan result di context untuk callback
+    context.user_data["lpteks_result"] = result
+    context.user_data["lpteks_user_id"] = user_id
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+
+async def handle_lpteks_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle konfirmasi simpan/batal laporan teks."""
+    from bot.services.report_parser import ParseResult
+    from bot.models import Transaction, MarketItem
+    from bot.services.balance import get_running_balance
+    from bot.services.sheets import append_transaction as sheets_append
+    from bot.services.audit import log_create
+    from sqlalchemy import func as sqlfunc, select
+
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "lpteks:batal":
+        await query.edit_message_text("❌ Dibatalkan.")
+        return
+
+    if data != "lpteks:simpan":
+        return
+
+    result: ParseResult = context.user_data.get("lpteks_result")
+    user_id: int = context.user_data.get("lpteks_user_id", update.effective_user.id)
+
+    if not result or not result.transactions:
+        await query.edit_message_text("❌ Data tidak ditemukan. Kirim ulang.")
+        return
+
+    await query.edit_message_text("⏳ Menyimpan transaksi...")
+
+    from bot.utils.formatters import fmt_rupiah, fmt_date
+    saved = 0
+    failed = 0
+
+    try:
+        async with AsyncSessionLocal() as session:
+            for tx_data in result.transactions:
+                try:
+                    tx = Transaction(
+                        user_id=user_id,
+                        type=tx_data.tx_type,
+                        amount=tx_data.amount,
+                        description=tx_data.description[:200],
+                        category=tx_data.category or None,
+                        transaction_date=tx_data.tx_date,
+                    )
+                    session.add(tx)
+                    await session.flush()
+                    await log_create(session, user_id, tx)
+
+                    # Update katalog market_items jika pasar
+                    if tx_data.category == 'pasar':
+                        item_name = re.sub(r'^Pasar\s*-\s*', '', tx_data.description).strip()
+                        existing = await session.execute(
+                            select(MarketItem).where(
+                                sqlfunc.lower(MarketItem.name) == item_name.lower()
+                            )
+                        )
+                        cat_item = existing.scalar_one_or_none()
+                        if cat_item:
+                            cat_item.use_count += 1
+                            cat_item.last_price = tx_data.amount
+                            cat_item.last_used = tx_data.tx_date
+                        else:
+                            session.add(MarketItem(
+                                name=item_name.title(),
+                                last_price=tx_data.amount,
+                                use_count=1,
+                                last_used=tx_data.tx_date,
+                            ))
+
+                    saved += 1
+                except Exception as e:
+                    logger.error(f"[LPTEKS] failed tx: {e}")
+                    failed += 1
+
+            await session.commit()
+            saldo = await get_running_balance(session, user_id)
+
+        # Google Sheets
+        for tx_data in result.transactions:
+            try:
+                await sheets_append(
+                    user_id=user_id,
+                    user_name=update.effective_user.full_name or "",
+                    tx_type=tx_data.tx_type,
+                    amount=tx_data.amount,
+                    description=tx_data.description,
+                    tx_date=tx_data.tx_date,
+                )
+            except Exception as e:
+                logger.warning(f"[LPTEKS] sheets: {e}")
+
+        msg = (
+            f"✅ *{saved} transaksi berhasil disimpan*"
+            + (f"\n❌ {failed} gagal" if failed else "")
+            + f"\n\n💰 Total masuk : *{fmt_rupiah(result.total_masuk)}*"
+            + f"\n💸 Total keluar: *{fmt_rupiah(result.total_keluar)}*"
+            + f"\n\n💳 Saldo: *{fmt_rupiah(saldo)}*"
+        )
+        try:
+            await query.edit_message_text(msg, parse_mode="Markdown")
+        except Exception:
+            await query.message.reply_text(msg.replace('*','').replace('_',''))
+
+    except Exception as e:
+        logger.exception(f"[LPTEKS] save error: {e}")
+        await query.edit_message_text(f"❌ Error: {e}")

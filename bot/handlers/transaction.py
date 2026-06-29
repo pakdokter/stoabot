@@ -88,8 +88,9 @@ async def cmd_keluar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     context.user_data.update(_p)
     context.user_data["tx_type"] = "keluar"
-    await update.message.reply_text("💸 *Catat Pengeluaran*\n\nNominal?", parse_mode="Markdown")
-    return TX_NOMINAL
+    # Tampilkan keyboard pilihan toko
+    from bot.handlers.market import show_toko_keyboard, PASAR_TOKO
+    return await show_toko_keyboard(update, context)
 
 
 async def handle_nominal(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -664,12 +665,32 @@ async def _simpan_masuk(update_or_query, context, user_id, keterangan, from_quer
     return ConversationHandler.END
 
 def build_transaction_conv() -> ConversationHandler:
+    from bot.handlers.market import (
+        handle_toko_callback, handle_pasar_input,
+        handle_pasar_konfirm, handle_pasar_manual_toko,
+        PASAR_TOKO, PASAR_TABEL, PASAR_MANUAL, PASAR_KONFIRM,
+    )
     return ConversationHandler(
         entry_points=[
             CommandHandler("masuk", cmd_masuk),
             CommandHandler("keluar", cmd_keluar),
         ],
         states={
+            # ── Pilih toko ──
+            PASAR_TOKO: [
+                CallbackQueryHandler(handle_toko_callback, pattern="^toko:"),
+            ],
+            # ── Tabel belanja pasar ──
+            PASAR_TABEL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pasar_input),
+            ],
+            PASAR_KONFIRM: [
+                CallbackQueryHandler(handle_pasar_konfirm, pattern="^pasar:"),
+            ],
+            # ── Toko manual / nominal (alur lama untuk toko non-pasar) ──
+            PASAR_MANUAL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_nominal),
+            ],
             TX_NOMINAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_nominal)],
             TX_KETERANGAN: [
                 CallbackQueryHandler(handle_sumber_callback, pattern="^sumber:"),

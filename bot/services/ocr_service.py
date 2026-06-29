@@ -1477,6 +1477,26 @@ def _parse_shopee_detail(text: str) -> OcrResult:
 
 
 
+
+def _is_bank_transfer(text: str) -> bool:
+    """Deteksi screenshot bukti transfer bank — bukan struk belanja."""
+    text_lower = text.lower()
+    indicators = [
+        r'transfer\s+successful',
+        r'transfer\s+amount',
+        r'beneficiary\s+name',
+        r'beneficiary\s+account',
+        r'reference\s+no',
+        r'source\s+of\s+fund',
+        r'transaction\s+type.*transfer',
+        r'transfer\s+to\s+bca',
+        r'transfer\s+currency',
+    ]
+    hits = sum(1 for p in indicators if re.search(p, text_lower))
+    return hits >= 3
+
+
+
 def _is_tiktok_order(text: str) -> bool:
     """Deteksi screenshot pesanan TikTok Shop."""
     indicators = [
@@ -1877,6 +1897,15 @@ def _parse_receipt_text(text: str) -> OcrResult:
     if _is_dineta_invoice(text):
         logger.info("[OCR] Dineta invoice detected")
         return _parse_dineta_invoice(text)
+
+    # Tolak bukti transfer bank (bukan struk belanja)
+    if _is_bank_transfer(text):
+        logger.info("[OCR] Bank transfer screenshot — bukan struk belanja")
+        result = OcrResult(raw_text=text)
+        result.merchant = None
+        result.confidence = 0.0
+        result._is_bank_transfer = True
+        return result
 
     if _is_tiktok_order(text):
         logger.info("[OCR] TikTok Shop order detected")

@@ -9,21 +9,35 @@ Format struk fisik:
   Format C : nomor item "N. NAMA", diikuti "QTY x Rp SATUAN  Rp TOTAL"
              (Fadhilah Frozen Foods)
   Format D : nama item, lalu SKU-batch + harga, lalu barcode + qty + total
-             (MR D.I.Y.)
+             Varian 1 (struk panjang): barcode 13 digit + 1 X + harga
+             Varian 2 (struk pendek): batch NN/NNN + "1 x harga" atau harga saja
+             (MR D.I.Y. / PT Daya Indah Yasa)
   Format E : Format B dengan Disc. per item di baris terpisah
              (Alfamart Selebung, varian dengan diskon per item)
-  Format F : nama item, lalu "Nx HARGA TOTAL"
+  Format F : nama item, lalu "Nx HARGA TOTAL" (lowercase x, spasi setelah x)
+             Mendukung OCR ter-join satu baris panjang (mode one-liner)
              (Harnila Store, kasir app generic)
   Format G : invoice tabel kolom, format IDR titik-koma (NNN.NNN,00)
+             Item: QTY UNIT SKU NAMA Rp UNIT_PRICE Rp AMOUNT
+             Total dari "Invoice Total : Rp NNN.NNN,00"
              (PT Dineta Jaya, supplier/distributor dengan invoice formal)
 
 Screenshot app:
   Shopee Pesanan Saya     - per separator toko (Selesai/Dikirim)
-  Shopee Rincian Pesanan  - per item + biaya tambahan, total pesanan
+  Shopee Rincian Pesanan  - per item + biaya tambahan, total dari Total-Subtotal
   Sukanda Jaya            - Harga Satuan + Total per item, SKU angka
-  TikTok Shop             - Pesanan dibuat, nama toko, item x qty, total BCA
-  QRIS BCA                - Payment Successful, form input manual toko/item
+  TikTok Shop             - Pesanan dibuat, nama toko "›", item x qty, Total: Rp
+  QRIS BCA                - Payment Successful, form input manual toko/item/total
   PT Dineta Jaya (G)      - Invoice formal, kolom Qty-Desc-UnitPrice-Amount
+
+Ditolak (bukan struk belanja):
+  Transfer BCA/bank       - Transfer Successful, Beneficiary Name, Reference No.
+                            → bot reply dengan panduan /masuk atau /keluar manual
+
+Format laporan teks (cmd /laporan_teks, bukan foto):
+  Laporan harian staff    - *TGL\\n• TOKO - NOMINAL\\n(TOTAL)
+                            Mendukung sub-item pasar: -nama - nominal\\n=total
+                            Mendukung "Uang Masuk" sebagai transaksi masuk
 """
 import re
 import httpx

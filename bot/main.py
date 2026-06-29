@@ -67,14 +67,17 @@ async def cmd_start(update, context):
     await update.message.reply_text(
         f"👋 Halo *{tg_name}*!\n\n"
         f"Saya adalah bot pencatat keuangan *{settings.business_name}*.\n\n"
-        "*Perintah tersedia:*\n"
+        "*📥 Pemasukan & Pengeluaran:*\n"
         "/masuk — catat pemasukan\n"
-        "/keluar — catat pengeluaran\n"
-        "/saldo — cek saldo\n"
+        "/keluar — catat pengeluaran (pilih toko atau pasar)\n\n"
+        "*📊 Laporan:*\n"
+        "/saldo — cek saldo saat ini\n"
         "/riwayat — riwayat transaksi\n"
-        "/laporan — laporan per periode\n"
         "/ringkas — ringkasan bulan ini\n"
+        "/laporan — laporan per periode\n"
         "/statement — e-statement PDF\n"
+        "/laporan\\_teks — rekap laporan teks harian staff\n\n"
+        "*✏️ Manajemen:*\n"
         "/edit — edit transaksi\n"
         "/hapus — hapus transaksi\n"
         "/cari — cari transaksi\n\n"
@@ -105,17 +108,18 @@ async def post_init(application: Application):
     await init_db()
     logger.info("Database initialized")
     await application.bot.set_my_commands([
-        BotCommand("masuk", "Catat pemasukan"),
-        BotCommand("keluar", "Catat pengeluaran"),
-        BotCommand("saldo", "Cek saldo"),
-        BotCommand("riwayat", "Riwayat transaksi"),
-        BotCommand("laporan", "Laporan per periode"),
-        BotCommand("ringkas", "Ringkasan bulan ini"),
-        BotCommand("statement", "E-statement PDF"),
-        BotCommand("edit", "Edit transaksi"),
-        BotCommand("hapus", "Hapus transaksi"),
-        BotCommand("cari", "Cari transaksi"),
-        BotCommand("batal", "Batalkan perintah aktif"),
+        BotCommand("masuk",        "Catat pemasukan"),
+        BotCommand("keluar",       "Catat pengeluaran (pilih toko/pasar)"),
+        BotCommand("saldo",        "Cek saldo saat ini"),
+        BotCommand("riwayat",      "Riwayat transaksi"),
+        BotCommand("ringkas",      "Ringkasan bulan ini"),
+        BotCommand("laporan",      "Laporan per periode"),
+        BotCommand("statement",    "E-statement PDF"),
+        BotCommand("laporan_teks", "Rekap laporan teks harian staff"),
+        BotCommand("edit",         "Edit transaksi"),
+        BotCommand("hapus",        "Hapus transaksi"),
+        BotCommand("cari",         "Cari transaksi"),
+        BotCommand("batal",        "Batalkan perintah aktif"),
     ])
     logger.info(f"Starting bot — {settings.business_name}")
 

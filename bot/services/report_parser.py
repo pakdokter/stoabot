@@ -302,8 +302,10 @@ def parse_report_text(text: str, year: int = None) -> ParseResult:
                 pasar_lines = []
                 # Jangan increment i, proses baris ini lagi
 
-        # Baris item: "• TOKO - NOMINAL"
-        if stripped.startswith('•') or stripped.startswith('–'):
+        # Baris item: "• TOKO - NOMINAL" atau "-Parkir - 2.000" di luar blok pasar
+        if stripped.startswith('•') or stripped.startswith('–') or (
+            stripped.startswith('-') and not in_pasar
+        ):
             if current_date is None:
                 result.errors.append(f"Item tanpa tanggal: {stripped}")
                 i += 1

@@ -25,10 +25,12 @@ def _esc(text: str) -> str:
     return str(text).replace('_', '\\_').replace('*', '\\*').replace('`', '\\`').replace('[', '\\[')
 
 OCR_KONFIRMASI    = 50
-OCR_EDIT_NOMINAL  = 51
-OCR_EDIT_MENU     = 52
-OCR_EDIT_MERCHANT = 53
-OCR_EDIT_DATE     = 54
+OCR_EDIT_NOMINAL   = 51
+OCR_EDIT_MENU      = 52
+OCR_EDIT_MERCHANT  = 53
+OCR_EDIT_DATE      = 54
+OCR_EDIT_ITEM_NAME = 55
+OCR_EDIT_ITEM_QTY  = 56
 OCR_QRIS_MERCHANT = 55
 OCR_QRIS_ITEM     = 56
 OCR_QRIS_QTY      = 57
@@ -329,16 +331,41 @@ async def ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "edit":
         _log(user_id, "WAITING_CONFIRMATION", "edit_menu_opened")
-        keyboard = InlineKeyboardMarkup([[
+        result: OcrResult = context.user_data.get("ocr_result")
+        has_items = result and len(result.items) > 0
+
+        # Tampilkan rincian item di atas menu edit
+        lines = ["✏️ *Edit Struk*\n"]
+        if result:
+            lines.append(f"Toko: *{_esc(result.merchant or '?')}*")
+            lines.append(f"Tanggal: *{fmt_date(result.tx_date)}*" if result.tx_date else "Tanggal: _hari ini_")
+            if result.items:
+                lines.append("\n🛒 *Item:*")
+                for i, item in enumerate(result.items, 1):
+                    qty_str = f" x{int(item.qty)}" if item.qty > 1 else ""
+                    lines.append(f"  {i}. {_esc(item.name)}{qty_str} — *{fmt_rupiah(item.line_total)}*")
+            if result.total:
+                lines.append(f"\nTotal: *{fmt_rupiah(result.total)}*")
+
+        lines.append("\n_Pilih bagian yang ingin diedit:_")
+
+        rows = [[
             InlineKeyboardButton("🏪 Nama Toko", callback_data="ocredit:merchant"),
             InlineKeyboardButton("📅 Tanggal", callback_data="ocredit:date"),
         ],[
             InlineKeyboardButton("💰 Nominal", callback_data="ocredit:nominal"),
-            InlineKeyboardButton("❌ Batal", callback_data="ocr:tidak"),
-        ]])
+        ]]
+        if has_items:
+            rows.append([
+                InlineKeyboardButton("📝 Nama Item", callback_data="ocredit:item_name"),
+                InlineKeyboardButton("🔢 Qty Item", callback_data="ocredit:item_qty"),
+            ])
+        rows.append([InlineKeyboardButton("❌ Batal", callback_data="ocr:tidak")])
+
+        keyboard = InlineKeyboardMarkup(rows)
         try:
             await query.edit_message_text(
-                "✏️ *Edit bagian mana?*", parse_mode="Markdown", reply_markup=keyboard
+                "\n".join(lines), parse_mode="Markdown", reply_markup=keyboard
             )
         except Exception as e:
             logger.error(f"[OCR] edit menu failed: {e}")
@@ -399,6 +426,80 @@ async def ocr_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception: pass
         context.user_data["ocr_edit_field"] = "date"
         return OCR_EDIT_DATE
+
+    if field == "item_name":
+        # Tampilkan daftar item dan minta pilih mana yang diedit
+        if not result.items:
+            await query.edit_message_text("❌ Tidak ada item yang bisa diedit.")
+            return OCR_KONFIRMASI
+        if len(result.items) == 1:
+            item = result.items[0]
+            context.user_data["ocr_edit_item_idx"] = 0
+            try:
+                await query.edit_message_text(
+                    f"📝 Nama item saat ini: *{_esc(item.name)}*\n\nMasukkan nama item baru:",
+                    parse_mode="Markdown",
+                )
+            except Exception: pass
+            context.user_data["ocr_edit_field"] = "item_name"
+            return OCR_EDIT_ITEM_NAME
+        # Lebih dari 1 item: tampilkan pilihan
+        rows = [[InlineKeyboardButton(f"{i+1}. {item.name[:30]}", callback_data=f"ocredit:item_name_idx_{i}")]
+                for i, item in enumerate(result.items)]
+        await query.edit_message_text(
+            "📝 Pilih item yang namanya ingin diedit:",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return OCR_EDIT_ITEM_NAME
+
+    if field.startswith("item_name_idx_"):
+        idx = int(field.split("_")[-1])
+        context.user_data["ocr_edit_item_idx"] = idx
+        item = result.items[idx]
+        try:
+            await query.edit_message_text(
+                f"📝 Nama item saat ini: *{_esc(item.name)}*\n\nMasukkan nama item baru:",
+                parse_mode="Markdown",
+            )
+        except Exception: pass
+        context.user_data["ocr_edit_field"] = "item_name"
+        return OCR_EDIT_ITEM_NAME
+
+    if field == "item_qty":
+        if not result.items:
+            await query.edit_message_text("❌ Tidak ada item.")
+            return OCR_KONFIRMASI
+        if len(result.items) == 1:
+            item = result.items[0]
+            context.user_data["ocr_edit_item_idx"] = 0
+            try:
+                await query.edit_message_text(
+                    f"🔢 Qty item *{_esc(item.name)}* saat ini: *{item.qty}*\n\nMasukkan qty baru:",
+                    parse_mode="Markdown",
+                )
+            except Exception: pass
+            context.user_data["ocr_edit_field"] = "item_qty"
+            return OCR_EDIT_ITEM_QTY
+        rows = [[InlineKeyboardButton(f"{i+1}. {item.name[:25]} (qty={item.qty})", callback_data=f"ocredit:item_qty_idx_{i}")]
+                for i, item in enumerate(result.items)]
+        await query.edit_message_text(
+            "🔢 Pilih item yang qty-nya ingin diedit:",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return OCR_EDIT_ITEM_QTY
+
+    if field.startswith("item_qty_idx_"):
+        idx = int(field.split("_")[-1])
+        context.user_data["ocr_edit_item_idx"] = idx
+        item = result.items[idx]
+        try:
+            await query.edit_message_text(
+                f"🔢 Qty item *{_esc(item.name)}* saat ini: *{item.qty}*\n\nMasukkan qty baru:",
+                parse_mode="Markdown",
+            )
+        except Exception: pass
+        context.user_data["ocr_edit_field"] = "item_qty"
+        return OCR_EDIT_ITEM_QTY
 
     return OCR_KONFIRMASI
 
@@ -529,6 +630,52 @@ async def ocr_edit_nominal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]])
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=keyboard)
     return OCR_KONFIRMASI
+
+
+async def ocr_edit_item_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler input nama item baru."""
+    text = update.message.text.strip()
+    result: OcrResult = context.user_data.get("ocr_result")
+    idx = context.user_data.get("ocr_edit_item_idx", 0)
+
+    if not result or idx >= len(result.items):
+        await update.message.reply_text("⏰ Sesi habis.")
+        return ConversationHandler.END
+
+    if len(text) < 2:
+        await update.message.reply_text("❌ Nama terlalu pendek.")
+        return OCR_EDIT_ITEM_NAME
+
+    result.items[idx].name = text.upper()
+    context.user_data["ocr_result"] = result
+    return await _show_ocr_confirm(update, result, from_edit=True)
+
+
+async def ocr_edit_item_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler input qty item baru."""
+    text = update.message.text.strip().replace(",", ".")
+    result: OcrResult = context.user_data.get("ocr_result")
+    idx = context.user_data.get("ocr_edit_item_idx", 0)
+
+    if not result or idx >= len(result.items):
+        await update.message.reply_text("⏰ Sesi habis.")
+        return ConversationHandler.END
+
+    try:
+        qty = float(text)
+        if qty <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Qty tidak valid. Masukkan angka (contoh: 2 atau 1.5)")
+        return OCR_EDIT_ITEM_QTY
+
+    item = result.items[idx]
+    item.qty = qty
+    item.line_total = item.unit_price * qty
+    # Update total struk
+    result.total = sum(i.line_total for i in result.items)
+    context.user_data["ocr_result"] = result
+    return await _show_ocr_confirm(update, result, from_edit=True)
 
 
 async def _do_save(update_or_query, context, user_id, from_query):
@@ -666,6 +813,14 @@ def build_ocr_conv() -> ConversationHandler:
             OCR_EDIT_DATE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ocr_edit_date),
                 MessageHandler(filters.PHOTO, handle_photo),
+            ],
+            OCR_EDIT_ITEM_NAME: [
+                CallbackQueryHandler(ocr_edit_menu, pattern="^ocredit:item_name_idx_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ocr_edit_item_name),
+            ],
+            OCR_EDIT_ITEM_QTY: [
+                CallbackQueryHandler(ocr_edit_menu, pattern="^ocredit:item_qty_idx_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ocr_edit_item_qty),
             ],
             OCR_QRIS_MERCHANT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, qris_input_merchant),

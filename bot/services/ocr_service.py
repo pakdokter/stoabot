@@ -73,6 +73,7 @@ class OcrResult:
     grand_total: Optional[float] = None
     cash_paid: Optional[float] = None
     change: Optional[float] = None
+    discount_amount: Optional[float] = None  # diskon/voucher dari struk
     discount: Optional[float] = None
     tx_date: Optional[date] = None
     items: list = field(default_factory=list)  # list of ReceiptItem
@@ -180,6 +181,7 @@ SKIP_LINE_PATTERNS = [
     r'^\d+\s*[xX]\s*rp',                       # "2 x Rp 55.000" (qty x satuan)
     r'\bcpm\s+qris\b',                       # CPM QRIS (payment method)
     r'^disc\.?\s*[-+]?[\d.,]+',              # "Disc. -1.000" per item bukan item
+    r'^voucher\s*:', r'^\([\d.,]+\)',          # "VOUCHER: (8,400)" bukan item
     r'\bken?balian\b',                        # kembalian/kenbalian
     r'^\d{1,2}/\d{2}/\d{4}',                 # tanggal DD/MM/YYYY (Amanah header)
     r'^SI\d+-\d+',                            # nomor struk Amanah "SI01-2606-4786"
@@ -2344,6 +2346,19 @@ def _parse_receipt_text(text: str) -> OcrResult:
         result.cash_paid = payment_values[0]
     if discount_values:
         result.discount = discount_values[0]
+        result.discount_amount = discount_values[0]
+
+    # Deteksi VOUCHER: (8,400) atau ANDA HEMAT sebagai discount_amount
+    if not result.discount_amount:
+        for line in lines:
+            ln = line.lower()
+            if re.search(r'voucher\s*:', ln) or re.search(r'anda\s+hemat', ln):
+                m_voucher = re.search(r'[(]?([\d,.]+)[)]?\s*$', line)
+                if m_voucher:
+                    v = _extract_money(m_voucher.group(0))
+                    if v:
+                        result.discount_amount = v[0][0]
+                        break
 
     if total_candidates:
         total_candidates.sort(key=lambda x: x[1])

@@ -35,7 +35,11 @@ OCR_QRIS_MERCHANT = 55
 OCR_QRIS_ITEM     = 56
 OCR_QRIS_QTY      = 57
 OCR_QRIS_TOTAL    = 58
-OCR_DISKON_KONFIRM = 61   # konfirmasi selisih item sum vs total (diskon/voucher)
+OCR_DISKON_KONFIRM  = 61   # konfirmasi diskon/voucher
+OCR_DONASI_KONFIRM  = 62   # konfirmasi pembulatan/donasi
+
+# Merchant yang sering ada pembulatan donasi kasir
+ROUNDUP_MERCHANTS = {'indomaret', 'alfamart', 'sinar bahagia', 'sb minimarket'}
 
 
 def _log(user_id, state, action, **kwargs):
@@ -92,35 +96,38 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
             )
 
-        # Deteksi selisih item sum vs total (kemungkinan diskon/voucher)
-        if result.items and result.total:
+        # ── Deteksi diskon/voucher dan donasi pembulatan ──────────────────
+        # Merchant pembulatan: Indomaret, Alfamart, Sinar Bahagia
+        merchant_lower = (result.merchant or '').lower()
+        is_roundup_merchant = any(m in merchant_lower for m in ROUNDUP_MERCHANTS)
+
+        # Diskon/Voucher: prioritaskan field discount_amount dari parser
+        # (VOUCHER: (8,400) atau ANDA HEMAT sudah diparsing)
+        # Fallback: selisih item sum vs total jika discount_amount tidak ada
+        diskon_amount = 0.0
+        if result.discount_amount and result.discount_amount > 0:
+            diskon_amount = result.discount_amount
+        elif result.items and result.total:
             item_sum = sum(i.line_total for i in result.items)
             selisih = round(item_sum - result.total)
-            # Toleransi: selisih > 500 dan < 50% dari total → kemungkinan diskon
             if 500 <= selisih <= result.total * 0.5:
-                context.user_data["ocr_result"] = result
-                context.user_data["ocr_diskon_selisih"] = selisih
-                keyboard = InlineKeyboardMarkup([[
-                    InlineKeyboardButton(
-                        f"✅ Ya, {fmt_rupiah(selisih)} adalah diskon/voucher",
-                        callback_data="diskon:ya"
-                    ),
-                ],[
-                    InlineKeyboardButton(
-                        "❌ Tidak, pakai total struk saja",
-                        callback_data="diskon:tidak"
-                    ),
-                ]])
-                await update.message.reply_text(
-                    f"💡 *Ditemukan selisih harga*\n\n"
-                    f"Jumlah item: *{fmt_rupiah(item_sum)}*\n"
-                    f"Total di struk: *{fmt_rupiah(result.total)}*\n"
-                    f"Selisih: *{fmt_rupiah(selisih)}*\n\n"
-                    f"Apakah *{fmt_rupiah(selisih)}* ini adalah diskon atau voucher?",
-                    parse_mode="Markdown",
-                    reply_markup=keyboard,
-                )
-                return OCR_DISKON_KONFIRM
+                diskon_amount = selisih
+
+        # Donasi/pembulatan: gunakan field `change` dari struk
+        # (KEMBALI: 300 → kembalian kecil = sinyal pembulatan donasi)
+        # Hanya untuk merchant yang biasa bulatkan ke donasi
+        donasi_amount = 0.0
+        if is_roundup_merchant and result.change and 0 < result.change <= 1000:
+            donasi_amount = result.change
+
+        context.user_data["ocr_result"] = result
+        context.user_data["ocr_diskon_amount"] = diskon_amount
+        context.user_data["ocr_donasi_amount"] = donasi_amount
+
+        # Tampilkan question form jika ada diskon DAN/ATAU donasi
+        if diskon_amount > 0 or donasi_amount > 0:
+            return await _show_diskon_donasi_form(update, context, result,
+                                                   diskon_amount, donasi_amount)
 
         return await _show_ocr_result(update, result)
     except Exception as e:
@@ -131,40 +138,106 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+async def _show_diskon_donasi_form(update, context, result, diskon_amount, donasi_amount):
+    """Tampilkan form konfirmasi diskon/voucher dan donasi sekaligus."""
+    item_sum = sum(i.line_total for i in result.items) if result.items else (result.total or 0)
+    total = result.total or 0
+
+    lines_out = ["\U0001f9fe *Rincian Transaksi*\n"]
+
+    if diskon_amount > 0 and abs(item_sum - total) > 1:
+        lines_out.append(f"Subtotal item  : *{fmt_rupiah(item_sum)}*")
+        lines_out.append(f"Diskon/Voucher : *\u2212 {fmt_rupiah(diskon_amount)}*")
+        lines_out.append(f"Total belanja  : *{fmt_rupiah(total)}*")
+    else:
+        lines_out.append(f"Total belanja  : *{fmt_rupiah(total)}*")
+
+    if donasi_amount > 0:
+        lines_out.append(f"Dibulatkan ke  : *{fmt_rupiah(total + donasi_amount)}*")
+        lines_out.append(f"Kembalian kecil: *{fmt_rupiah(donasi_amount)}*")
+
+    lines_out.append(f"\nToko: *{_esc(result.merchant or '?')}*")
+    lines_out.append("\n*Konfirmasi pencatatan:*")
+
+    rows = []
+    if diskon_amount > 0 and donasi_amount > 0:
+        rows.append([InlineKeyboardButton(
+            f"\u2705 Diskon {fmt_rupiah(diskon_amount)} masuk + Donasi {fmt_rupiah(donasi_amount)}",
+            callback_data="dd:diskon_ya_donasi_ya"
+        )])
+        rows.append([InlineKeyboardButton(
+            f"\u2705 Diskon {fmt_rupiah(diskon_amount)} masuk + Kembalian diambil",
+            callback_data="dd:diskon_ya_donasi_tidak"
+        )])
+        rows.append([InlineKeyboardButton(
+            "\u274c Abaikan keduanya \u2014 pakai total struk saja",
+            callback_data="dd:semua_tidak"
+        )])
+    elif diskon_amount > 0:
+        rows.append([InlineKeyboardButton(
+            f"\u2705 Ya, catat {fmt_rupiah(diskon_amount)} sebagai masuk (diskon)",
+            callback_data="dd:diskon_ya_donasi_tidak"
+        )])
+        rows.append([InlineKeyboardButton(
+            "\u274c Tidak perlu dicatat terpisah",
+            callback_data="dd:semua_tidak"
+        )])
+    elif donasi_amount > 0:
+        rows.append([InlineKeyboardButton(
+            f"\U0001f49d Donasikan {fmt_rupiah(donasi_amount)} (tidak kembali)",
+            callback_data="dd:diskon_tidak_donasi_ya"
+        )])
+        rows.append([InlineKeyboardButton(
+            f"\U0001f4b5 Ambil kembalian {fmt_rupiah(donasi_amount)}",
+            callback_data="dd:semua_tidak"
+        )])
+
+    await update.message.reply_text(
+        "\n".join(lines_out),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return OCR_DISKON_KONFIRM
+
+
 async def handle_diskon_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle konfirmasi diskon/voucher dari selisih item sum vs total."""
+    """Handle konfirmasi diskon/voucher dan donasi pembulatan."""
     query = update.callback_query
     await query.answer()
 
     result: OcrResult = context.user_data.get("ocr_result")
-    selisih = context.user_data.get("ocr_diskon_selisih", 0)
+    diskon_amount = context.user_data.get("ocr_diskon_amount", 0)
+    donasi_amount = context.user_data.get("ocr_donasi_amount", 0)
 
     if not result:
         await query.edit_message_text("⏰ Sesi habis.")
         return ConversationHandler.END
 
-    if query.data == "diskon:ya":
-        # Total tetap = total struk (sudah dikurangi diskon)
-        # Tambahkan info diskon ke catatan
-        result._diskon_amount = selisih
-        await query.edit_message_text(
-            f"✅ Diskon *{fmt_rupiah(selisih)}* dicatat.\n"
-            f"Total yang akan disimpan: *{fmt_rupiah(result.total)}*",
-            parse_mode="Markdown",
-        )
-    else:
-        # Tidak ada diskon — pakai total struk apa adanya
-        await query.edit_message_text(
-            f"Oke, total *{fmt_rupiah(result.total)}* akan digunakan.",
-            parse_mode="Markdown",
-        )
+    data = query.data  # "dd:diskon_ya_donasi_ya" dll
+    parts = data.split(":")[1] if ":" in data else ""
 
-    context.user_data["ocr_result"] = result
-    # Setelah callback, kirim sebagai pesan baru (tidak ada update.message)
-    # Buat Update-like object dengan message dari query
+    catat_diskon = "diskon_ya" in parts
+    catat_donasi = "donasi_ya" in parts
+
+    context.user_data["ocr_catat_diskon"] = catat_diskon
+    context.user_data["ocr_catat_donasi"] = catat_donasi
+    context.user_data["ocr_diskon_amount"] = diskon_amount if catat_diskon else 0
+    context.user_data["ocr_donasi_amount"] = donasi_amount if catat_donasi else 0
+
+    lines_out = ["✅ *Rencana pencatatan:*\n"]
+    lines_out.append(f"➖ Belanja *{_esc(result.merchant or '?')}* — *{fmt_rupiah(result.total)}*")
+    if catat_diskon and diskon_amount > 0:
+        lines_out.append(f"➕ Diskon/Voucher — *{fmt_rupiah(diskon_amount)}*")
+    if catat_donasi and donasi_amount > 0:
+        lines_out.append(f"➖ Donasi — *{fmt_rupiah(donasi_amount)}*")
+
+    await query.edit_message_text("\n".join(lines_out), parse_mode="Markdown")
+
     class _FakeUpdate:
         def __init__(self, q): self.message = q.message; self.effective_user = q.from_user
     return await _show_ocr_result(_FakeUpdate(query), result)
+
+
 
 
 async def handle_shopee_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, result: OcrResult):
@@ -776,16 +849,28 @@ async def _do_save(update_or_query, context, user_id, from_query):
         for item in result.items:
             qty_str = f" x{int(item.qty)}" if item.qty > 1 else ""
             desc = f"{merchant} — {item.name}{qty_str}"[:200]
-            transactions_to_save.append((item.line_total, desc))
+            transactions_to_save.append(("keluar", item.line_total, desc))
     else:
-        transactions_to_save.append((amount, merchant))
+        transactions_to_save.append(("keluar", amount, merchant))
+
+    # Tambah transaksi diskon sebagai masuk
+    catat_diskon = context.user_data.get("ocr_catat_diskon", False)
+    diskon_amount = context.user_data.get("ocr_diskon_amount", 0)
+    if catat_diskon and diskon_amount > 0:
+        transactions_to_save.append(("masuk", diskon_amount, f"Diskon/Voucher {merchant}"))
+
+    # Tambah transaksi donasi sebagai keluar
+    catat_donasi = context.user_data.get("ocr_catat_donasi", False)
+    donasi_amount = context.user_data.get("ocr_donasi_amount", 0)
+    if catat_donasi and donasi_amount > 0:
+        transactions_to_save.append(("keluar", donasi_amount, f"Donasi {merchant}"))
 
     try:
         async with AsyncSessionLocal() as session:
             saved_ids = []
-            for tx_amount, tx_desc in transactions_to_save:
+            for tx_type, tx_amount, tx_desc in transactions_to_save:
                 tx = Transaction(
-                    user_id=user_id, type="keluar", amount=tx_amount,
+                    user_id=user_id, type=tx_type, amount=tx_amount,
                     description=tx_desc, transaction_date=tx_date,
                 )
                 session.add(tx)
@@ -890,7 +975,7 @@ def build_ocr_conv() -> ConversationHandler:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ocr_edit_item_qty),
             ],
             OCR_DISKON_KONFIRM: [
-                CallbackQueryHandler(handle_diskon_callback, pattern="^diskon:"),
+                CallbackQueryHandler(handle_diskon_callback, pattern="^dd:"),
             ],
             OCR_QRIS_MERCHANT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, qris_input_merchant),

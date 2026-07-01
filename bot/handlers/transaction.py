@@ -448,9 +448,24 @@ async def edit_pilih_tx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.data == "cancel":
-        await query.edit_message_text("❌ Edit dibatalkan.")
+    if query.data in ("cancel", "edit_selesai"):
+        await query.edit_message_text("✅ Selesai.")
         return ConversationHandler.END
+
+    if query.data == "edit_lagi":
+        # Tampilkan ulang daftar transaksi untuk diedit
+        user_id = update.effective_user.id
+        async with AsyncSessionLocal() as session:
+            txs = await _recent_transactions(session, 10, user_id=user_id)
+        if not txs:
+            await query.edit_message_text("Tidak ada transaksi.")
+            return ConversationHandler.END
+        await query.edit_message_text(
+            "✏️ *Edit Transaksi*\nPilih transaksi yang ingin diubah:",
+            reply_markup=_tx_inline_keyboard(txs),
+            parse_mode="Markdown",
+        )
+        return EDIT_PILIH
 
     tx_id = query.data.split(":")[1]
     context.user_data["edit_tx_id"] = tx_id
@@ -525,16 +540,18 @@ async def edit_input_nilai(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await log_update(session, tg_user.id, old_vals, tx)
         await session.commit()
 
-        saldo = await get_running_balance(session2, user_id=user_id)
+        saldo = await get_running_balance(session, user_id=tg_user.id)
 
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✏️ Edit lagi", callback_data="edit_lagi"),
+        InlineKeyboardButton("✅ Selesai", callback_data="edit_selesai"),
+    ]])
     await update.message.reply_text(
-        f"✅ Transaksi berhasil diperbarui.\n\n💰 Saldo saat ini: *{fmt_rupiah(saldo)}*",
+        f"✅ *Transaksi berhasil diperbarui*\n\n💰 Saldo: *{fmt_rupiah(saldo)}*",
         parse_mode="Markdown",
+        reply_markup=keyboard,
     )
-    _p = {k: context.user_data[k] for k in ("session_verified","db_user") if k in context.user_data}
-    context.user_data.clear()
-    context.user_data.update(_p)
-    return ConversationHandler.END
+    return EDIT_PILIH
 
 
 # ──────────────────────────────────────────────
@@ -565,9 +582,23 @@ async def hapus_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.data == "cancel":
-        await query.edit_message_text("❌ Penghapusan dibatalkan.")
+    if query.data in ("cancel", "hapus_selesai"):
+        await query.edit_message_text("✅ Selesai.")
         return ConversationHandler.END
+
+    if query.data == "hapus_lagi":
+        user_id = update.effective_user.id
+        async with AsyncSessionLocal() as session:
+            txs = await _recent_transactions(session, 10, user_id=user_id)
+        if not txs:
+            await query.edit_message_text("Tidak ada transaksi.")
+            return ConversationHandler.END
+        await query.edit_message_text(
+            "🗑️ *Hapus Transaksi*\nPilih transaksi yang ingin dihapus:",
+            reply_markup=_tx_inline_keyboard(txs),
+            parse_mode="Markdown",
+        )
+        return HAPUS_KONFIRMASI
 
     tx_id = query.data.split(":")[1]
     tg_user = update.effective_user
@@ -584,13 +615,18 @@ async def hapus_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await log_delete(session, tg_user.id, tx)
         await session.commit()
 
-        saldo = await get_running_balance(session2, user_id=user_id)
+        saldo = await get_running_balance(session, user_id=tg_user.id)
 
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🗑️ Hapus lagi", callback_data="hapus_lagi"),
+        InlineKeyboardButton("✅ Selesai", callback_data="hapus_selesai"),
+    ]])
     await query.edit_message_text(
-        f"🗑️ Transaksi berhasil dihapus.\n\n💰 Saldo saat ini: *{fmt_rupiah(saldo)}*",
+        f"🗑️ *Transaksi berhasil dihapus*\n\n💰 Saldo: *{fmt_rupiah(saldo)}*",
         parse_mode="Markdown",
+        reply_markup=keyboard,
     )
-    return ConversationHandler.END
+    return HAPUS_KONFIRMASI
 
 
 # ──────────────────────────────────────────────

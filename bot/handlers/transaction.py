@@ -31,7 +31,8 @@ from bot.handlers.auth import ensure_registered
     EDIT_PILIH, EDIT_FIELD, EDIT_NILAI,
     HAPUS_KONFIRMASI,
     TX_SUMBER_LAINNYA,
-) = range(8)
+    TX_TANGGAL_MANUAL,
+) = range(9)
 
 SUMBER_MASUK = ["Bank Biru", "Kasir", "Lainnya"]
 
@@ -126,27 +127,74 @@ async def handle_keterangan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Keterangan tidak boleh kosong.")
         return TX_KETERANGAN
     context.user_data["tx_desc"] = desc_text
-    await update.message.reply_text("Tanggal? (kosongkan jika hari ini, format: DD/MM/YYYY)")
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📅 Hari ini", callback_data="tanggal:hari_ini"),
+        InlineKeyboardButton("✏️ Tgl lain", callback_data="tanggal:lain"),
+    ]])
+    await update.message.reply_text(
+        "Tanggal transaksi?",
+        reply_markup=keyboard,
+    )
+    return TX_TANGGAL
+
+
+async def handle_tanggal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle tombol Hari ini / Tgl lain."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data  # "tanggal:hari_ini" atau "tanggal:lain"
+
+    if data == "tanggal:hari_ini":
+        context.user_data["tx_date"] = date.today()
+        return await _do_save_from_context(query, context)
+
+    if data == "tanggal:lain":
+        try:
+            await query.edit_message_text(
+                "Masukkan tanggal:\n_(Format: DD/MM/YYYY, contoh: 15/06/2026)_",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        return TX_TANGGAL_MANUAL
+
     return TX_TANGGAL
 
 
 async def handle_tanggal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle input tanggal manual (teks DD/MM/YYYY)."""
     text = update.message.text.strip()
     if text in ("-", "skip", ""):
         tx_date = date.today()
     else:
         tx_date = parse_date(text)
         if not tx_date:
-            await update.message.reply_text("❌ Format tanggal tidak dikenali. Contoh: 15/07/2026 atau kosongkan.")
-            return TX_TANGGAL
+            await update.message.reply_text(
+                "❌ Format tidak dikenali. Contoh: 15/06/2026\n"
+                "Atau ketik `-` untuk hari ini."
+            )
+            return TX_TANGGAL_MANUAL
 
     context.user_data["tx_date"] = tx_date
+    return await _do_save_from_context(update, context)
 
-    # Simpan transaksi
-    tg_user = update.effective_user
+
+async def _do_save_from_context(update_or_query, context: ContextTypes.DEFAULT_TYPE):
+    """Simpan transaksi dari context.user_data."""
+    from telegram import Update as TgUpdate
+    is_query = not isinstance(update_or_query, TgUpdate)
+
+    if is_query:
+        tg_user = update_or_query.from_user
+        reply_fn = update_or_query.message.reply_text
+    else:
+        tg_user = update_or_query.effective_user
+        reply_fn = update_or_query.message.reply_text
     tx_type = context.user_data["tx_type"]
     amount = context.user_data["tx_amount"]
     desc_text = context.user_data["tx_desc"]
+    tx_date = context.user_data.get("tx_date", date.today())
 
     async with AsyncSessionLocal() as session:
         tx = Transaction(
@@ -695,6 +743,12 @@ def build_transaction_conv() -> ConversationHandler:
             TX_KETERANGAN: [
                 CallbackQueryHandler(handle_sumber_callback, pattern="^sumber:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_keterangan),
+            ],
+            TX_TANGGAL: [
+                CallbackQueryHandler(handle_tanggal_callback, pattern="^tanggal:"),
+            ],
+            TX_TANGGAL_MANUAL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tanggal),
             ],
             TX_SUMBER_LAINNYA: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_sumber_lainnya),

@@ -223,7 +223,7 @@ async def _do_save_from_context(update_or_query, context: ContextTypes.DEFAULT_T
     )
 
     emoji = "✅" if tx_type == "masuk" else "✅"
-    await update.message.reply_text(
+    await reply_fn(
         f"✅ *Transaksi berhasil disimpan*\n\n"
         f"Jenis: {_tx_type_emoji(tx_type)} {'MASUK' if tx_type == 'masuk' else 'KELUAR'}\n"
         f"Nominal: *{fmt_rupiah(amount)}*\n"

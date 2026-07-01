@@ -893,10 +893,10 @@ async def _do_save(update_or_query, context, user_id, from_query):
         # Simpan ke Google Sheets — per item
         db_user = context.user_data.get("db_user")
         user_name = db_user.full_name if db_user else str(user_id)
-        for tx_amount, tx_desc in transactions_to_save:
+        for tx_type, tx_amount, tx_desc in transactions_to_save:
             await sheets_append(
                 user_id=user_id, user_name=user_name,
-                tx_type="keluar", amount=tx_amount,
+                tx_type=tx_type, amount=tx_amount,
                 description=tx_desc, tx_date=tx_date,
                 source="struk",
             )

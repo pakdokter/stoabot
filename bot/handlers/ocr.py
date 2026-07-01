@@ -29,12 +29,13 @@ OCR_EDIT_NOMINAL   = 51
 OCR_EDIT_MENU      = 52
 OCR_EDIT_MERCHANT  = 53
 OCR_EDIT_DATE      = 54
-OCR_EDIT_ITEM_NAME = 55
-OCR_EDIT_ITEM_QTY  = 56
+OCR_EDIT_ITEM_NAME = 59
+OCR_EDIT_ITEM_QTY  = 60
 OCR_QRIS_MERCHANT = 55
 OCR_QRIS_ITEM     = 56
 OCR_QRIS_QTY      = 57
 OCR_QRIS_TOTAL    = 58
+OCR_DISKON_KONFIRM = 61   # konfirmasi selisih item sum vs total (diskon/voucher)
 
 
 def _log(user_id, state, action, **kwargs):
@@ -91,6 +92,36 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
             )
 
+        # Deteksi selisih item sum vs total (kemungkinan diskon/voucher)
+        if result.items and result.total:
+            item_sum = sum(i.line_total for i in result.items)
+            selisih = round(item_sum - result.total)
+            # Toleransi: selisih > 500 dan < 50% dari total → kemungkinan diskon
+            if 500 <= selisih <= result.total * 0.5:
+                context.user_data["ocr_result"] = result
+                context.user_data["ocr_diskon_selisih"] = selisih
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        f"✅ Ya, {fmt_rupiah(selisih)} adalah diskon/voucher",
+                        callback_data="diskon:ya"
+                    ),
+                ],[
+                    InlineKeyboardButton(
+                        "❌ Tidak, pakai total struk saja",
+                        callback_data="diskon:tidak"
+                    ),
+                ]])
+                await update.message.reply_text(
+                    f"💡 *Ditemukan selisih harga*\n\n"
+                    f"Jumlah item: *{fmt_rupiah(item_sum)}*\n"
+                    f"Total di struk: *{fmt_rupiah(result.total)}*\n"
+                    f"Selisih: *{fmt_rupiah(selisih)}*\n\n"
+                    f"Apakah *{fmt_rupiah(selisih)}* ini adalah diskon atau voucher?",
+                    parse_mode="Markdown",
+                    reply_markup=keyboard,
+                )
+                return OCR_DISKON_KONFIRM
+
         return await _show_ocr_result(update, result)
     except Exception as e:
         logger.exception(f"[OCR] uid={user_id} failed: {e}")
@@ -98,6 +129,42 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return ConversationHandler.END
 
+
+
+async def handle_diskon_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle konfirmasi diskon/voucher dari selisih item sum vs total."""
+    query = update.callback_query
+    await query.answer()
+
+    result: OcrResult = context.user_data.get("ocr_result")
+    selisih = context.user_data.get("ocr_diskon_selisih", 0)
+
+    if not result:
+        await query.edit_message_text("⏰ Sesi habis.")
+        return ConversationHandler.END
+
+    if query.data == "diskon:ya":
+        # Total tetap = total struk (sudah dikurangi diskon)
+        # Tambahkan info diskon ke catatan
+        result._diskon_amount = selisih
+        await query.edit_message_text(
+            f"✅ Diskon *{fmt_rupiah(selisih)}* dicatat.\n"
+            f"Total yang akan disimpan: *{fmt_rupiah(result.total)}*",
+            parse_mode="Markdown",
+        )
+    else:
+        # Tidak ada diskon — pakai total struk apa adanya
+        await query.edit_message_text(
+            f"Oke, total *{fmt_rupiah(result.total)}* akan digunakan.",
+            parse_mode="Markdown",
+        )
+
+    context.user_data["ocr_result"] = result
+    # Setelah callback, kirim sebagai pesan baru (tidak ada update.message)
+    # Buat Update-like object dengan message dari query
+    class _FakeUpdate:
+        def __init__(self, q): self.message = q.message; self.effective_user = q.from_user
+    return await _show_ocr_result(_FakeUpdate(query), result)
 
 
 async def handle_shopee_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, result: OcrResult):
@@ -821,6 +888,9 @@ def build_ocr_conv() -> ConversationHandler:
             OCR_EDIT_ITEM_QTY: [
                 CallbackQueryHandler(ocr_edit_menu, pattern="^ocredit:item_qty_idx_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ocr_edit_item_qty),
+            ],
+            OCR_DISKON_KONFIRM: [
+                CallbackQueryHandler(handle_diskon_callback, pattern="^diskon:"),
             ],
             OCR_QRIS_MERCHANT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, qris_input_merchant),

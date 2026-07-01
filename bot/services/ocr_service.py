@@ -21,6 +21,9 @@ Format struk fisik:
              Item: QTY UNIT SKU NAMA Rp UNIT_PRICE Rp AMOUNT
              Total dari "Invoice Total : Rp NNN.NNN,00"
              (PT Dineta Jaya, supplier/distributor dengan invoice formal)
+  Format H : nama item + harga, lalu "N SET X harga_asli(diskon)", lalu total
+             Total dari "Total Bayar NNN" atau "Total NNN"
+             (Dapur Kita, toko bahan makanan retail)
 
 Screenshot app:
   Shopee Pesanan Saya     - per separator toko (Selesai/Dikirim)
@@ -980,8 +983,8 @@ def _classify_line(line: str) -> str:
     if _matches_any(line, SKIP_LINE_PATTERNS): return 'skip'
     if _matches_any(line, CHANGE_KEYWORDS): return 'change'
     if _matches_any(line, SAVINGS_KEYWORDS): return 'skip'   # hemat/voucher bukan item
+    if _matches_any(line, TOTAL_KEYWORDS): return 'total'    # cek total dulu (Total Bayar > Bayar)
     if _matches_any(line, PAYMENT_KEYWORDS): return 'payment'
-    if _matches_any(line, TOTAL_KEYWORDS): return 'total'
     if _matches_any(line, DISCOUNT_KEYWORDS): return 'discount'
     if _matches_any(line, TAX_KEYWORDS): return 'tax'
     return 'unknown'
@@ -1554,21 +1557,35 @@ def _try_parse_bca_transfer_belanja(text: str) -> 'OcrResult | None':
     if not remarks:
         return None
 
-    # Remarks yang terlihat seperti keterangan barang/belanja
-    # Bukan: "payment", "hutang", nama orang saja, nomor saja
-    STOP_REMARKS = re.compile(
-        r'^(transfer|bayar|hutang|cicil|angsuran|gaji|salary|'
-        r'[a-z\s]{1,20}$)',  # hanya nama/kata pendek tanpa angka = bukan item
-        re.IGNORECASE
-    )
-    has_product_clue = bool(re.search(
-        r'\d|kg|gr|gram|liter|lt|pcs|pack|ikat|ekor|buah|dus|karton|'
-        r'pickup|ambil|beli|order|pesanan',
-        remarks, re.IGNORECASE
-    ))
+    # Supplier yang dikenal — transfer ke mereka selalu dianggap belanja
+    # meski Remarks berisi kode order (SOL, INV, dll)
+    KNOWN_SUPPLIERS = [
+        'sukanda', 'sukanda jaya', 'primer', 'dinda', 'dineta',
+        'fadhilah', 'amanah', 'mak opik', 'grosir', 'supplier',
+    ]
+    # Cek beneficiary name dari teks (sebelum merchant di-set)
+    ben_match = re.search(r'beneficiary\s+name\s*\t*(.+)', text, re.IGNORECASE)
+    beneficiary_lower = ben_match.group(1).strip().lower() if ben_match else ''
+    is_known_supplier = any(s in beneficiary_lower for s in KNOWN_SUPPLIERS)
 
-    if not has_product_clue:
-        return None  # Remarks ada tapi tidak terlihat seperti item belanja
+    # Kode order murni: SOL2906..., INV..., hanya huruf+angka tanpa spasi/kata
+    is_order_code = bool(re.match(r'^[A-Z]{2,5}\d{6,}$', remarks.strip()))
+    # Nomor saja
+    is_pure_number = bool(re.match(r'^[\d\s\-/]+$', remarks.strip()))
+
+    has_product_clue = (
+        not is_order_code and
+        not is_pure_number and
+        bool(re.search(
+            r'\d+\s*(kg|gr|gram|liter|lt|pcs|pack|ikat|ekor|buah|dus|karton)|'
+            r'(pickup|ambil|beli|order|pesanan)\b',
+            remarks, re.IGNORECASE
+        ))
+    )
+
+    # Lolos jika: ada keterangan barang ATAU supplier yang dikenal
+    if not has_product_clue and not is_known_supplier:
+        return None  # Transfer biasa, bukan belanja
 
     # Ambil Transfer Amount
     amount = None
@@ -1614,8 +1631,14 @@ def _try_parse_bca_transfer_belanja(text: str) -> 'OcrResult | None':
     result.tx_date = tx_date
     result.confidence = 0.85
 
-    # Item dari remarks
-    item_name = remarks.strip().title()
+    # Item: gunakan remarks jika berisi keterangan barang,
+    # atau nama merchant jika remarks adalah kode order
+    if is_order_code or is_pure_number:
+        # Kode order — simpan sebagai "Bayar ke Supplier (kode)"
+        item_name = f"Pembayaran {merchant or 'Supplier'}"
+    else:
+        item_name = remarks.strip().title()
+
     result.items = [ReceiptItem(
         name=item_name[:60],
         qty=1.0,
@@ -1760,6 +1783,97 @@ def _parse_tiktok_order(text: str) -> OcrResult:
 
     logger.info(f"[OCR] TikTok: merchant={result.merchant!r} items={len(items)} total={result.total}")
     return result
+
+
+
+
+def _is_format_h(lines: list) -> bool:
+    """
+    Format H — Dapur Kita dan toko retail serupa.
+    Ciri: ada pola "N SET X harga(diskon)" atau "Total Bayar" + "Total Qty".
+    """
+    joined = ' '.join(lines).lower()
+    return (
+        bool(re.search(r'\d+\s*set\s*x\s*[\d.,]+', joined, re.IGNORECASE)) or
+        (bool(re.search(r'total\s+bayar', joined)) and
+         bool(re.search(r'total\s+qty', joined)))
+    )
+
+
+def _parse_items_format_h(lines: list) -> list:
+    """
+    Parse Format H — Dapur Kita.
+
+    Pola per item:
+      NAMA ITEM [SKU]    193,500       ← nama + harga (kadang ada SKU di tengah)
+      1 SET X 199,500(6,000 )          ← qty x harga_asli(diskon)
+      193,500                          ← total setelah diskon (opsional)
+
+    Total struk: "Total Bayar NNN" atau "Total NNN" setelah semua item.
+    """
+    SKIP_H = {
+        'total', 'bayar', 'kembali', 'edc', 'cash', 'hemat', 'qty',
+        'member', 'silver', 'gold', 'platinum', 'harga', 'ppn', 'terima',
+        'kasih', 'complaint', 'kritik', 'saran', 'bertanggung', 'jawab',
+        'kekeliruan', 'kekurangan', 'kerusakan', 'meninggalkan', 'free',
+        'dapatkan', 'menukarkan', 'struk', 'kami', 'tidak',
+    }
+
+    items = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+
+        # Pola qty: "1 SET X 199,500(6,000)" atau "2 PCS X 50,000"
+        qty_m = re.match(
+            r'^(\d+)\s+(SET|PCS|KG|GR|BTL|PCK|PACK|BKS|LTR)\s+X\s+([\d.,]+)',
+            line, re.IGNORECASE
+        )
+        if qty_m:
+            qty = float(qty_m.group(1))
+            unit = qty_m.group(2).upper()
+            # Cari harga setelah diskon: ambil dari baris sebelumnya (total)
+            # atau dari angka terakhir di baris ini
+            price_after_discount = None
+
+            # Cek baris sebelumnya — bisa berisi harga akhir
+            if i > 0:
+                prev = lines[i-1].strip()
+                prev_money = _extract_money(prev)
+                # Jika baris sebelumnya hanya angka (total item)
+                if prev_money and re.match(r'^[\d,.\s]+$', prev):
+                    price_after_discount = prev_money[-1][0]
+
+            # Jika tidak ketemu, ambil dari baris nama item (2 baris ke atas)
+            if not price_after_discount and i >= 1:
+                prev = lines[i-1].strip()
+                prev_money = _extract_money(prev)
+                if prev_money:
+                    price_after_discount = prev_money[-1][0]
+
+            if price_after_discount and price_after_discount >= 100:
+                # Ambil nama dari baris sebelum qty (bersihkan dari kode SKU)
+                name_line = lines[i-1].strip() if i > 0 else ""
+                # Hapus harga di akhir nama
+                name_clean = re.sub(r'\s+[\d,]+\s*$', '', name_line).strip()
+                # Hapus kode SKU (pola huruf+angka panjang di tengah)
+                name_clean = re.sub(r'\b[A-Z]{2,}-[A-Z0-9]{3,}\b', '', name_clean).strip()
+                name_clean = re.sub(r'\s{2,}', ' ', name_clean).strip()
+
+                if len(name_clean) >= 2:
+                    items.append(ReceiptItem(
+                        name=name_clean.upper()[:60],
+                        qty=qty,
+                        unit=unit,
+                        unit_price=price_after_discount / qty,
+                        line_total=price_after_discount,
+                    ))
+
+            i += 1
+            continue
+
+        i += 1
+    return items
 
 
 
@@ -2127,6 +2241,9 @@ def _parse_receipt_text(text: str) -> OcrResult:
         'pt. daya indah': 'MR D.I.Y.',
         'pt daya indah': 'MR D.I.Y.',
         'daya inoan': 'MR D.I.Y.',
+        # Toko retail lain
+        'dapur kita': 'Dapur Kita',
+        'boga kita': 'Dapur Kita',
     }
 
     text_lower = text.lower()
@@ -2138,6 +2255,14 @@ def _parse_receipt_text(text: str) -> OcrResult:
     # Override khusus: Dineta sering salah karena alamat "Stoa Space" terbaca duluan
     if 'dineta' in text_lower and result.merchant in (None, 'Stoa Space', ''):
         result.merchant = 'PT Dineta Jaya'
+
+    # Override: Indomaret bisa terbaca sebagai CV franchisee-nya
+    if (result.merchant not in ('Indomaret',) and
+        ('klikindomaret' in text_lower or
+         'layanan konsumen' in text_lower and 'indomaret' in text_lower or
+         re.search(r'\d{2}\.\d{2}\.\d{2}-\d{2}:\d{2}/\d+\.\d+\.\d+/', text_lower))):
+        # Kode struk Indomaret: "01.07.26-08:38/4.3.1/FCFO-330/..."
+        result.merchant = 'Indomaret'
 
     # Jika tidak ada known merchant, cari dari baris awal
     if not result.merchant:
@@ -2243,10 +2368,12 @@ def _parse_receipt_text(text: str) -> OcrResult:
     # 1. Fadhilah (numbered items "N. NAMA")
     # 2. MR D.I.Y. (nama → SKU → barcode+harga)
     # 3. Format F (Harnila: "Nx HARGA  TOTAL")
-    # 4. Format A/B (fallback)
+    # 4. Format H (Dapur Kita: nama + "N SET X harga(diskon)")
+    # 5. Format A/B (fallback)
     items_fadhilah = _parse_items_format_fadhilah(lines) if _is_fadhilah_format(lines) else []
     items_mrdiy = _parse_items_format_mrdiy(lines)
     items_f = _parse_items_format_f(lines) if _is_format_f(lines) else []
+    items_h = _parse_items_format_h(lines) if _is_format_h(lines) else []
 
     if items_fadhilah:
         items = items_fadhilah
@@ -2254,6 +2381,8 @@ def _parse_receipt_text(text: str) -> OcrResult:
         items = items_mrdiy
     elif items_f:
         items = items_f
+    elif items_h:
+        items = items_h
     elif items_mrdiy and len(items_mrdiy) >= 1:
         # Verifikasi: semua item MR DIY harus punya harga wajar
         mrdiy_ok = all(100 <= i.line_total <= 5_000_000 for i in items_mrdiy)

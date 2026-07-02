@@ -212,16 +212,7 @@ async def _do_save_from_context(update_or_query, context: ContextTypes.DEFAULT_T
     async with AsyncSessionLocal() as session2:
         saldo = await get_running_balance(session2, user_id=tg_user.id)
 
-    # Simpan ke Google Sheets
-    db_user = context.user_data.get("db_user")
-    user_name = db_user.full_name if db_user else str(tg_user.id)
-    await sheets_append(
-        user_id=tg_user.id, user_name=user_name,
-        tx_type=tx_type, amount=amount,
-        description=desc_text, tx_date=tx_date,
-        source="manual",
-    )
-
+    # Reply user DULU sebelum Sheets (Sheets jalan di background)
     emoji = "✅" if tx_type == "masuk" else "✅"
     await reply_fn(
         f"✅ *Transaksi berhasil disimpan*\n\n"
@@ -232,6 +223,23 @@ async def _do_save_from_context(update_or_query, context: ContextTypes.DEFAULT_T
         f"💰 Saldo saat ini:\n*{fmt_rupiah(saldo)}*",
         parse_mode="Markdown",
     )
+
+    # Sheets di background -- tidak tunda reply user
+    db_user = context.user_data.get("db_user")
+    user_name = db_user.full_name if db_user else str(tg_user.id)
+    async def _bg():
+        try:
+            await sheets_append(
+                user_id=tg_user.id, user_name=user_name,
+                tx_type=tx_type, amount=amount,
+                description=desc_text, tx_date=tx_date,
+                source="manual",
+            )
+        except Exception as e:
+            logger.warning(f"[TX] sheets bg failed: {e}")
+    import asyncio
+    asyncio.create_task(_bg())
+
     _p = {k: context.user_data[k] for k in ("session_verified","db_user") if k in context.user_data}
     context.user_data.clear()
     context.user_data.update(_p)

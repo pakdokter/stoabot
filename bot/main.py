@@ -24,7 +24,7 @@ from bot.handlers.transaction import (
     cmd_saldo, cmd_riwayat, cmd_cari,
     build_transaction_conv, build_edit_conv, build_hapus_conv,
 )
-from bot.handlers.market import cmd_harga, cmd_sync_harga
+from bot.handlers.market import cmd_harga, cmd_sync_harga, cmd_refresh_katalog
 from bot.handlers.report import cmd_ringkas, build_laporan_conv, build_statement_conv, build_laporan_teks_conv
 from bot.handlers.ocr import build_ocr_conv
 
@@ -119,12 +119,27 @@ async def post_init(application: Application):
         BotCommand("laporan_teks", "Rekap laporan teks harian staff"),
         BotCommand("harga",        "Cek harga item dari database"),
         BotCommand("sync_harga",   "Sync katalog harga ke Google Sheets"),
+        BotCommand("refresh_katalog", "Refresh katalog alias item dari Sheets"),
         BotCommand("edit",         "Edit transaksi"),
         BotCommand("hapus",        "Hapus transaksi"),
         BotCommand("cari",         "Cari transaksi"),
         BotCommand("batal",        "Batalkan perintah aktif"),
     ])
     logger.info(f"Starting bot — {settings.business_name}")
+
+    # Load alias table dari Google Sheets ke memory (non-blocking)
+    async def _load_aliases():
+        try:
+            from bot.services.alias_resolver import load_alias_table
+            from bot.services.sheets import _get_client
+            import os
+            _gc = _get_client()
+            _sid = os.environ.get("GOOGLE_SHEET_ID")
+            if _gc and _sid:
+                await load_alias_table(_gc, _sid, force=True)
+        except Exception as _e:
+            logger.warning(f"[ALIAS] startup load failed: {_e}")
+    asyncio.create_task(_load_aliases())
 
 
 # ── App builder ───────────────────────────────────────────────────────

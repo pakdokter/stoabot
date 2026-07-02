@@ -149,6 +149,9 @@ async def show_pasar_table(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_pasar_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Parse input tabel pasar dari teks user."""
+    # Guard: bisa dipanggil via callback query (tidak ada message)
+    if not update.message or not update.message.text:
+        return PASAR_TABEL
     text = update.message.text.strip()
     if not text:
         await update.message.reply_text("❌ Input kosong. Ketik ulang.")

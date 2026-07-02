@@ -752,8 +752,9 @@ def build_transaction_conv() -> ConversationHandler:
     from bot.handlers.market import (
         handle_toko_callback, handle_pasar_input,
         handle_pasar_konfirm, handle_pasar_manual_toko,
+        handle_pasar_nama_toko,
         show_toko_keyboard,
-        PASAR_TOKO, PASAR_TABEL, PASAR_MANUAL, PASAR_KONFIRM,
+        PASAR_TOKO, PASAR_TABEL, PASAR_MANUAL, PASAR_KONFIRM, PASAR_NAMA_TOKO,
     )
     return ConversationHandler(
         entry_points=[
@@ -774,7 +775,11 @@ def build_transaction_conv() -> ConversationHandler:
             PASAR_KONFIRM: [
                 CallbackQueryHandler(handle_pasar_konfirm, pattern="^pasar:"),
             ],
-            # ── Toko manual / nominal (alur lama untuk toko non-pasar) ──
+            # ── Input nama toko manual (pilih Lainnya) ──
+            PASAR_NAMA_TOKO: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pasar_nama_toko),
+            ],
+            # ── Input nominal untuk toko biasa atau toko manual ──
             PASAR_MANUAL: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_nominal),
             ],

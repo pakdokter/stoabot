@@ -91,14 +91,9 @@ async def handle_toko_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("Ketik nama toko:")
         return PASAR_NAMA_TOKO
     else:
-        # Toko dari daftar favorit → langsung minta nominal
-        context.user_data["tx_type"] = "keluar"
-        context.user_data["tx_keterangan_prefix"] = toko
-        await query.edit_message_text(
-            f"💸 *{_esc(toko)}*\n\nNominal?",
-            parse_mode="Markdown",
-        )
-        return PASAR_MANUAL
+        # Toko dari daftar → langsung tampilkan form item
+        context.user_data["pasar_toko"] = toko
+        return await show_toko_item_form(query, context, toko)
 
 
 async def show_pasar_table(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -182,11 +177,19 @@ async def handle_pasar_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["pasar_items"] = items
     total = sum(i["total"] for i in items)
 
-    preview_lines = ["📋 *Rekap Belanja Pasar*\n"]
+    toko = context.user_data.get("pasar_toko", "Pasar")
+    is_pasar = toko == "pasar"
+    toko_label = "Pasar" if is_pasar else toko
+
+    preview_lines = [f"📋 *Rekap {_esc(toko_label)}*\n"]
     for item in items:
         qty_str = f"{item['qty']} {item['unit']}".strip()
+        if qty_str and qty_str not in ("1.0", "1"):
+            qty_str = f" ({qty_str})"
+        else:
+            qty_str = ""
         preview_lines.append(
-            f"  • {_esc(item['name'])} {qty_str} — *{fmt_rupiah(item['total'])}*"
+            f"  • {_esc(item['name'])}{qty_str} — *{fmt_rupiah(item['total'])}*"
         )
     preview_lines.append(f"\n💰 *Total: {fmt_rupiah(total)}*")
 
@@ -338,6 +341,10 @@ async def _simpan_pasar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     saved_ids = []
     total_all = 0.0
+    toko = context.user_data.get("pasar_toko", "pasar")
+    is_pasar = toko == "pasar"
+    toko_label = "Pasar" if is_pasar else toko
+    category = "pasar" if is_pasar else None
 
     try:
         async with AsyncSessionLocal() as session:
@@ -347,7 +354,7 @@ async def _simpan_pasar(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return ConversationHandler.END
 
             for item in items:
-                desc = f"Pasar — {item['name']}"
+                desc = f"{toko_label} — {item['name']}"
                 qty_str = f" x{item['qty']} {item['unit']}".rstrip()
                 if item["qty"] != 1 or item["unit"]:
                     desc += qty_str
@@ -357,7 +364,7 @@ async def _simpan_pasar(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     type="keluar",
                     amount=item["total"],
                     description=desc[:200],
-                    category="pasar",
+                    category=category,
                     transaction_date=tx_date,
                 )
                 session.add(tx)
@@ -417,7 +424,7 @@ async def _simpan_pasar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     # Pesan sukses
-    lines = ["✅ *Belanja Pasar Tersimpan*\n"]
+    lines = [f"✅ *{toko_label} Tersimpan*\n"]
     for item in items:
         qty_str = f"{item['qty']} {item['unit']}".strip()
         if qty_str and qty_str != "1.0":
@@ -438,13 +445,8 @@ async def _simpan_pasar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-async def handle_pasar_manual_toko(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle input nama toko manual (untuk 'Lainnya') — DEPRECATED, lihat handle_pasar_nama_toko."""
-    return await handle_pasar_nama_toko(update, context)
-
-
 async def handle_pasar_nama_toko(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Terima nama toko dari user, lalu minta nominal."""
+    """Terima nama toko dari user, lalu tampilkan form item."""
     if not update.message or not update.message.text:
         return PASAR_NAMA_TOKO
     toko = update.message.text.strip()
@@ -452,10 +454,30 @@ async def handle_pasar_nama_toko(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("❌ Nama toko terlalu pendek. Ketik ulang:")
         return PASAR_NAMA_TOKO
     context.user_data["pasar_toko"] = toko
-    context.user_data["tx_type"] = "keluar"
-    context.user_data["tx_keterangan_prefix"] = toko
-    await update.message.reply_text(
-        f"💸 *{_esc(toko)}*\n\nNominal?",
-        parse_mode="Markdown",
+    return await show_toko_item_form(update.message, context, toko)
+
+
+async def show_toko_item_form(msg_or_query, context, toko: str):
+    """
+    Tampilkan form input item untuk toko non-pasar.
+    Format sama dengan pasar: "Nama item, qty, harga" per baris.
+    Kalau hanya 1 item tanpa qty, cukup: "nama, harga"
+    """
+    text = (
+        f"💸 *{_esc(toko)}*\n\n"
+        "Ketik item belanja:\n"
+        "`nama item, qty, harga`\n\n"
+        "*Contoh satu item:*\n"
+        "`Minyak goreng, 3, 138600`\n\n"
+        "*Contoh beberapa item:*\n"
+        "`Minyak goreng, 3, 138600`\n"
+        "`Beras premium 5kg, 1, 74500`\n\n"
+        "_Jika hanya nominal total, cukup tulis:_\n"
+        "`91000`"
     )
-    return PASAR_MANUAL
+    # Bisa dari query atau message
+    if hasattr(msg_or_query, 'edit_message_text'):
+        await msg_or_query.edit_message_text(text, parse_mode="Markdown")
+    else:
+        await msg_or_query.reply_text(text, parse_mode="Markdown")
+    return PASAR_TABEL

@@ -1298,11 +1298,282 @@ def _parse_shopee_detail(text: str) -> OcrResult:
     """
     Parse halaman Rincian Pesanan Shopee.
 
-    Struktur output:
-    - Setiap item produk → ReceiptItem tersendiri
-    - Biaya layanan + ongkir → satu ReceiptItem terpisah di akhir
-    - Total pesanan = total semua item + biaya layanan + ongkir
+    DUA SKENARIO yang ditangani secara berbeda:
+
+    Skenario A -- 1 item produk:
+      Simpan sebagai 1 transaksi dengan total = Total Pesanan (bukan harga produk).
+      Komponen biaya (ongkir net, voucher, layanan) ditampilkan di summary
+      tapi TIDAK disimpan sebagai transaksi terpisah karena sudah termasuk dalam
+      Total Pesanan yang dibayar.
+
+    Skenario B -- lebih dari 1 item produk:
+      Setiap item disimpan dengan harga proporsional dari Total Pesanan.
+      Proporsional = (harga_item / subtotal_produk) * total_pesanan
+      Sehingga sum(line_total semua item) = Total Pesanan.
+      Biaya tambahan sudah terdistribusi proporsional ke setiap item.
+
+    Dalam kedua skenario, yang disimpan ke DB selalu Total Pesanan,
+    bukan Subtotal Produk.
     """
+    from datetime import date as _date
+    from bot.utils.formatters import fmt_rupiah
+    result = OcrResult(raw_text=text)
+    result.tx_date = _date.today()
+    result.merchant = "Shopee"
+    result.is_shopee_detail = True
+
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+    # ── Merchant ──
+    merchant = None
+    for i, line in enumerate(lines):
+        if re.search(r'Star\+|Mall\s*\|', line):
+            clean = re.sub(r'(Star\+|Mall\s*\|\s*ORI)\s*\t?\s*', '', line).strip()
+            clean = re.sub(r'\t.*', '', clean).strip()
+            if clean and len(clean) > 2:
+                merchant = clean
+                break
+        # "COLOOMP >" pola toko tanpa Star+
+        if re.search(r'[›>]\s*$', line) and not re.search(r'ubah|hubungi|batalkan|lihat', line, re.IGNORECASE):
+            candidate = re.sub(r'\s*[›>]\s*$', '', line).split('\t')[0].strip()
+            if 2 <= len(candidate) <= 50:
+                merchant = candidate
+                break
+
+    result.merchant = merchant or "Shopee"
+
+    # ── Ekstrak semua komponen harga ──
+    def _parse_rp(pattern, src):
+        m = re.search(pattern, src, re.IGNORECASE)
+        if m:
+            raw = m.group(1).replace('.', '').replace(',', '')
+            return float(raw) if raw.isdigit() else 0.0
+        return 0.0
+
+    subtotal_produk  = _parse_rp(r'Subtotal\s+Produk\s*[\t:]+Rp([\d.,]+)', text)
+    subtotal_ongkir  = _parse_rp(r'Subtotal\s+Pengiriman\s*[\t:]+Rp([\d.,]+)', text)
+    diskon_ongkir    = _parse_rp(r'(?:Subtotal\s+)?Diskon\s+Pengiriman\s*[\t:]+-?Rp([\d.,]+)', text)
+    voucher_shopee   = _parse_rp(r'Voucher\s+Shopee[^\n]*[\t:]-?Rp([\d.,]+)', text)
+    voucher_toko     = _parse_rp(r'Voucher\s+Toko[^\n]*[\t:]-?Rp([\d.,]+)', text)
+    biaya_layanan    = _parse_rp(r'Biaya\s+Layanan[^\n]*[\t:]Rp([\d.,]+)', text)
+
+    # ── Total Pesanan (yang benar-benar dibayar) ──
+    total_pesanan = 0.0
+    total_m = re.search(r'Total\s+Pesanan\s*:\s*Rp([\d.,]+)', text, re.IGNORECASE)
+    if total_m:
+        raw = total_m.group(1).replace('.', '').replace(',', '')
+        if raw.isdigit():
+            total_pesanan = float(raw)
+    result.total = total_pesanan
+
+    # ── Parse items produk ──
+    SKIP_KEYWORDS = re.compile(
+        r'subtotal|total|tunai|kembali|diskon|voucher|pengiriman|layanan|'
+        r'butuh|bantuan|hubungi|batalkan|penjual|spx|jne|sicepat|anteraja|'
+        r'jnt|ninja|flash|alamat|lihat|star\+|mall|ori|standard|express|'
+        r'pesanan|dibuat|menunggu|sedang|diantarkan|transit|kurir',
+        re.IGNORECASE
+    )
+
+    items_raw = []  # list of (name, qty, price_per_item)
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if SKIP_KEYWORDS.search(line):
+            i += 1
+            continue
+        if merchant and merchant.lower() in line.lower():
+            i += 1
+            continue
+
+        # Ekstrak nama item
+        if '\t' in line:
+            parts = [p.strip() for p in line.split('\t') if p.strip()]
+            valid = [p for p in parts
+                     if len(p) >= 4
+                     and not re.match(r'^Rp', p)
+                     and not SKIP_KEYWORDS.search(p)
+                     and not re.match(r'^[xX]\d+$', p)]
+            name_raw = max(valid, key=len) if valid else parts[0]
+        else:
+            name_raw = line
+
+        # Bersihkan nama
+        name_raw = re.sub(r'^[A-Za-z]{2,6}\s*[-\.]+\s*', '', name_raw)
+        name_raw = re.sub(r'^\d+\.\s*', '', name_raw)
+        name_raw = re.sub(r'^[•·\-]+\s*', '', name_raw)
+        name_raw = re.sub(r'\t.*$', '', name_raw)
+        name_raw = re.sub(r'\s*\.{3}\s*$', '', name_raw).strip()
+        name_raw = re.sub(r'[…]+\s*$', '', name_raw).strip()
+
+        if len(name_raw) < 4 or SKIP_KEYWORDS.search(name_raw):
+            i += 1
+            continue
+
+        # Cari qty dan harga
+        qty = 1
+        price = None
+        j = i + 1
+
+        while j < len(lines):
+            nxt = lines[j].strip()
+            if re.match(r'^[xX]\d+$', nxt):
+                qty = int(re.match(r'^[xX](\d+)$', nxt).group(1))
+                j += 1
+                break
+            if re.match(r'^Rp[\d.,\s]+', nxt) or SKIP_KEYWORDS.search(nxt):
+                break
+            qty_inline = re.search(r'[xX](\d+)\s*$', nxt)
+            if qty_inline:
+                qty = int(qty_inline.group(1))
+                ext = re.sub(r'\s*[xX]\d+\s*$', '', nxt).strip()
+                if ext and not SKIP_KEYWORDS.search(ext):
+                    name_raw = (name_raw + ' ' + ext).strip()
+                j += 1
+                break
+            if not SKIP_KEYWORDS.search(nxt) and len(nxt) >= 2 and not re.match(r'^\d+\s*(kg|gr|pcs|ml|ltr)', nxt, re.IGNORECASE):
+                name_raw = (name_raw + ' ' + nxt).strip()
+                j += 1
+            else:
+                break
+
+        # Ambil harga item (harga asli, sebelum voucher)
+        if j < len(lines):
+            price_line = lines[j].strip()
+            prices_m = re.findall(r'Rp([\d.,]+)', price_line)
+            if prices_m:
+                # Ambil harga TERAKHIR (setelah diskon jika ada dua harga)
+                raw = prices_m[-1].replace('.', '').replace(',', '')
+                if raw.isdigit():
+                    price = float(raw)
+                j += 1
+
+        if name_raw and len(name_raw) >= 3 and price and price >= 100:
+            items_raw.append({'name': name_raw, 'qty': float(qty), 'price': price})
+            i = j
+        else:
+            i += 1
+
+    # ── SKENARIO A vs B ──────────────────────────────────────────────────────
+    # Distribusi total pesanan ke item secara proporsional
+    items = []
+    n_items = len(items_raw)
+
+    if n_items == 0:
+        # Tidak ada item terdeteksi -- simpan sebagai 1 transaksi total
+        pass
+
+    elif n_items == 1:
+        # SKENARIO A: 1 item
+        # line_total = Total Pesanan (bukan harga produk)
+        item = items_raw[0]
+        items.append(ReceiptItem(
+            name=item['name'].upper()[:60],
+            qty=item['qty'],
+            unit="",
+            unit_price=total_pesanan / item['qty'] if item['qty'] > 0 and total_pesanan > 0 else item['price'],
+            line_total=total_pesanan if total_pesanan > 0 else item['price'],
+        ))
+
+    else:
+        # SKENARIO B: multiple items
+        # Distribusi Total Pesanan secara proporsional berdasarkan harga item
+        sum_prices = sum(d['price'] for d in items_raw)
+        for item in items_raw:
+            if sum_prices > 0 and total_pesanan > 0:
+                ratio = item['price'] / sum_prices
+                proportional_total = round(ratio * total_pesanan)
+            else:
+                proportional_total = item['price']
+
+            # Bersihkan duplikasi kata di nama (misal "58MM 58MM" -> "58MM")
+            import re as _re
+            clean_name = item['name'].upper()
+            words = clean_name.split()
+            seen = []
+            for w in words:
+                if w not in seen:
+                    seen.append(w)
+            clean_name = ' '.join(seen)[:60]
+
+            items.append(ReceiptItem(
+                name=clean_name,
+                qty=item['qty'],
+                unit="",
+                unit_price=round(proportional_total / item['qty']) if item['qty'] > 0 else proportional_total,
+                line_total=proportional_total,
+            ))
+
+        # Koreksi pembulatan agar sum tepat = total_pesanan
+        if total_pesanan > 0 and items:
+            diff = int(total_pesanan) - sum(int(i.line_total) for i in items)
+            if diff != 0:
+                items[-1].line_total += diff
+                items[-1].unit_price = items[-1].line_total / items[-1].qty
+
+    result.items = items
+
+    # ── Summary untuk konfirmasi ──────────────────────────────────────────────
+    net_ongkir = max(0, subtotal_ongkir - diskon_ongkir)
+    toko_display = result.merchant
+
+    if n_items <= 1:
+        # Skenario A: tampilkan breakdown lengkap
+        summary_lines = [f"🛍 *Shopee -- {toko_display}*\n"]
+        if items:
+            item = items[0]
+            qty_str = f" ({int(item.qty)} pcs)" if item.qty > 1 else ""
+            summary_lines.append(f"Produk: {item.name}{qty_str}")
+            summary_lines.append(f"Harga produk : Rp{int(items_raw[0]['price'] if items_raw else total_pesanan):,}".replace(',', '.'))
+        summary_lines.append("")
+        if net_ongkir > 0:
+            summary_lines.append(f"Ongkir (net) : Rp{int(net_ongkir):,}".replace(',', '.'))
+        if voucher_shopee > 0:
+            summary_lines.append(f"Voucher Shopee : -Rp{int(voucher_shopee):,}".replace(',', '.'))
+        if voucher_toko > 0:
+            summary_lines.append(f"Voucher Toko   : -Rp{int(voucher_toko):,}".replace(',', '.'))
+        if biaya_layanan > 0:
+            summary_lines.append(f"Biaya layanan  : Rp{int(biaya_layanan):,}".replace(',', '.'))
+        summary_lines.append("")
+        summary_lines.append(f"*Total dibayar : Rp{int(total_pesanan):,}*".replace(',', '.'))
+
+    else:
+        # Skenario B: tampilkan distribusi per item
+        summary_lines = [f"🛍 *Shopee -- {toko_display}* ({n_items} item)\n"]
+        for item in items:
+            qty_str = f" x{int(item.qty)}" if item.qty > 1 else ""
+            summary_lines.append(f"  • {item.name}{qty_str}")
+            summary_lines.append(f"    Rp{int(item.line_total):,}".replace(',', '.') + " (proporsional dari total)")
+        summary_lines.append("")
+        if net_ongkir > 0:
+            summary_lines.append(f"Ongkir (net)   : Rp{int(net_ongkir):,}".replace(',', '.'))
+        if voucher_shopee > 0:
+            summary_lines.append(f"Voucher Shopee : -Rp{int(voucher_shopee):,}".replace(',', '.'))
+        if voucher_toko > 0:
+            summary_lines.append(f"Voucher Toko   : -Rp{int(voucher_toko):,}".replace(',', '.'))
+        if biaya_layanan > 0:
+            summary_lines.append(f"Biaya layanan  : Rp{int(biaya_layanan):,}".replace(',', '.'))
+        summary_lines.append("")
+        summary_lines.append(f"*Total dibayar : Rp{int(total_pesanan):,}*".replace(',', '.'))
+        summary_lines.append(f"_(didistribusi proporsional ke {n_items} item)_")
+
+    result.shopee_summary = "\n".join(summary_lines)
+    result.shopee_item = items[0].name if items else "Item Shopee"
+    result.shopee_qty = int(items[0].qty) if items else 1
+
+    score = 0.3
+    score += 0.3 if result.total else 0.0
+    score += 0.2 if items else 0.0
+    score += 0.2 if merchant else 0.0
+    result.confidence = round(score, 2)
+
+    logger.info(
+        f"[OCR] Shopee detail: merchant={result.merchant!r} "
+        f"scenario={'A(1 item)' if n_items <= 1 else f'B({n_items} items)'} "
+        f"total={result.total}"
+    )
+    return result
+
     from datetime import date as _date
     from bot.utils.formatters import fmt_rupiah
     result = OcrResult(raw_text=text)
@@ -1475,16 +1746,42 @@ def _parse_shopee_detail(text: str) -> OcrResult:
         if raw.isdigit():
             result.total = float(raw)
 
+    # ── Parse komponen biaya untuk ditampilkan ──
+    def _parse_rp(pattern, text):
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            raw = m.group(1).replace('.', '').replace(',', '')
+            return float(raw) if raw.isdigit() else 0.0
+        return 0.0
+
+    subtotal_ongkir = _parse_rp(r'Subtotal\s+Pengiriman\s*[\t:]+Rp([\d.,]+)', text)
+    diskon_ongkir = _parse_rp(r'(?:Subtotal\s+)?Diskon\s+Pengiriman\s*[\t:]+-?Rp([\d.,]+)', text)
+    voucher_shopee = _parse_rp(r'Voucher\s+Shopee[^\n]*[\t:]-?Rp([\d.,]+)', text)
+    voucher_toko = _parse_rp(r'Voucher\s+Toko[^\n]*[\t:]-?Rp([\d.,]+)', text)
+    biaya_layanan = _parse_rp(r'Biaya\s+Layanan[^\n]*[\t:]Rp([\d.,]+)', text)
+
     result.items = items
 
-    # ── Summary untuk konfirmasi ──
-    summary_lines = [f"Terdeteksi belanja via Shopee"]
-    summary_lines.append(f"Nama Merchant: {result.merchant}")
+    # ── Summary untuk konfirmasi -- tampilkan komponen harga ──
+    summary_lines = [f"Shopee: *{result.merchant or 'Toko'}*\n"]
     for item in items:
         qty_str = f" x{int(item.qty)}" if item.qty > 1 else ""
-        summary_lines.append(f"  • {item.name}{qty_str} — {fmt_rupiah(item.line_total)}")
+        summary_lines.append(f"  • {item.name}{qty_str} -- Rp{int(item.line_total):,}".replace(',', '.'))
+    summary_lines.append("")
+    if subtotal_produk > 0:
+        summary_lines.append(f"Subtotal produk : Rp{int(subtotal_produk):,}".replace(',', '.'))
+    if subtotal_ongkir > 0:
+        net_ongkir = subtotal_ongkir - diskon_ongkir
+        if net_ongkir > 0:
+            summary_lines.append(f"Ongkir (net)    : Rp{int(net_ongkir):,}".replace(',', '.'))
+    if voucher_shopee > 0:
+        summary_lines.append(f"Voucher Shopee  : -Rp{int(voucher_shopee):,}".replace(',', '.'))
+    if voucher_toko > 0:
+        summary_lines.append(f"Voucher Toko    : -Rp{int(voucher_toko):,}".replace(',', '.'))
+    if biaya_layanan > 0:
+        summary_lines.append(f"Biaya layanan   : Rp{int(biaya_layanan):,}".replace(',', '.'))
     if result.total:
-        summary_lines.append(f"Total Pesanan: {fmt_rupiah(result.total)}")
+        summary_lines.append(f"\nTotal dibayar   : *Rp{int(result.total):,}*".replace(',', '.'))
 
     result.shopee_summary = "\n".join(summary_lines)
     result.shopee_item = items[0].name if items else "Item Shopee"

@@ -126,7 +126,21 @@ async def record_item_price(
     if not item_name_raw or total_price <= 0:
         return None
 
-    item_name = normalize_item_name(item_name_raw)
+    # Resolve alias -> canonical name (from Google Sheets catalog)
+    try:
+        from bot.services.alias_resolver import resolve_and_track, needs_refresh, load_alias_table
+        if needs_refresh():
+            from bot.services.sheets import _get_client
+            import os
+            _gc = _get_client()
+            _sid = os.environ.get("GOOGLE_SHEET_ID")
+            if _gc and _sid:
+                import asyncio
+                asyncio.create_task(load_alias_table(_gc, _sid))
+        item_name = resolve_and_track(item_name_raw)
+    except Exception:
+        item_name = normalize_item_name(item_name_raw)
+
     if not item_name:
         return None
 

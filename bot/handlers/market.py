@@ -591,3 +591,28 @@ async def cmd_sync_harga(update, context):
             await update.message.reply_text("⚠️ Tidak ada data harga untuk di-sync.")
     except Exception as e:
         await update.message.reply_text(f"❌ Gagal sync: {e}")
+
+
+async def cmd_refresh_katalog(update, context):
+    """/refresh_katalog -- reload alias table dari sheet Katalog Item."""
+    import os
+    from bot.services.alias_resolver import load_alias_table
+    from bot.services.sheets import _get_client
+
+    await update.message.reply_text("⏳ Memuat ulang katalog alias...")
+
+    sid = os.environ.get("GOOGLE_SHEET_ID")
+    if not sid:
+        await update.message.reply_text("❌ GOOGLE_SHEET_ID tidak dikonfigurasi.")
+        return
+    try:
+        gc = _get_client()
+        count = await load_alias_table(gc, sid, force=True)
+        await update.message.reply_text(
+            f"✅ *Katalog alias dimuat ulang*\n"
+            f"Total alias aktif: *{count}*\n\n"
+            "_Semua transaksi baru akan menggunakan canonical name dari sheet Katalog Item._",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Gagal: {e}")

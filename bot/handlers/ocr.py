@@ -887,6 +887,25 @@ async def _do_save(update_or_query, context, user_id, from_query):
             await session.commit()
             logger.info(f"[OCR] saved {len(saved_ids)} tx(s), first_id={tx_id}")
 
+            # Record item prices for price catalog
+            try:
+                from bot.services.item_price_service import record_item_price
+                for item in result.items:
+                    await record_item_price(
+                        session=session,
+                        item_name_raw=item.name,
+                        toko=merchant,
+                        total_price=float(item.line_total),
+                        qty=float(item.qty),
+                        unit=str(item.unit or ''),
+                        transaction_date=tx_date,
+                        transaction_id=tx_id,
+                    )
+                if result.items:
+                    await session.commit()
+            except Exception as ep:
+                logger.warning(f"[PRICE] record failed: {ep}")
+
         async with AsyncSessionLocal() as session2:
             saldo = await get_running_balance(session2, user_id=user_id)
 

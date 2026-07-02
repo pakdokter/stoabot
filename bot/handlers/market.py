@@ -41,10 +41,11 @@ TOKO_FAVORIT = [
 ]
 
 # States untuk ConversationHandler
-PASAR_TOKO    = "pasar_toko"
-PASAR_TABEL   = "pasar_tabel"
-PASAR_MANUAL  = "pasar_manual"    # fallback teks jika WebApp tidak tersedia
-PASAR_KONFIRM = "pasar_konfirm"
+PASAR_TOKO      = "pasar_toko"
+PASAR_TABEL     = "pasar_tabel"
+PASAR_MANUAL    = "pasar_manual"    # input nominal untuk toko biasa
+PASAR_KONFIRM   = "pasar_konfirm"
+PASAR_NAMA_TOKO = "pasar_nama_toko" # input nama toko manual (pilih Lainnya)
 
 
 def _esc(text: str) -> str:
@@ -88,9 +89,9 @@ async def handle_toko_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return await show_pasar_table(update, context)
     elif toko == "lainnya":
         await query.edit_message_text("Ketik nama toko:")
-        return PASAR_MANUAL
+        return PASAR_NAMA_TOKO
     else:
-        # Toko biasa → minta nominal langsung (alur lama)
+        # Toko dari daftar favorit → langsung minta nominal
         context.user_data["tx_type"] = "keluar"
         context.user_data["tx_keterangan_prefix"] = toko
         await query.edit_message_text(
@@ -438,12 +439,23 @@ async def _simpan_pasar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_pasar_manual_toko(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle input nama toko manual (untuk 'Lainnya')."""
+    """Handle input nama toko manual (untuk 'Lainnya') — DEPRECATED, lihat handle_pasar_nama_toko."""
+    return await handle_pasar_nama_toko(update, context)
+
+
+async def handle_pasar_nama_toko(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Terima nama toko dari user, lalu minta nominal."""
+    if not update.message or not update.message.text:
+        return PASAR_NAMA_TOKO
     toko = update.message.text.strip()
     if len(toko) < 2:
-        await update.message.reply_text("❌ Nama toko terlalu pendek.")
-        return PASAR_MANUAL
+        await update.message.reply_text("❌ Nama toko terlalu pendek. Ketik ulang:")
+        return PASAR_NAMA_TOKO
     context.user_data["pasar_toko"] = toko
+    context.user_data["tx_type"] = "keluar"
     context.user_data["tx_keterangan_prefix"] = toko
-    await update.message.reply_text(f"Nominal untuk *{_esc(toko)}*?", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"💸 *{_esc(toko)}*\n\nNominal?",
+        parse_mode="Markdown",
+    )
     return PASAR_MANUAL

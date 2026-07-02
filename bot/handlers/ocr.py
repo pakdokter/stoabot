@@ -866,6 +866,7 @@ async def _do_save(update_or_query, context, user_id, from_query):
         transactions_to_save.append(("keluar", donasi_amount, f"Donasi {merchant}"))
 
     try:
+        # ── 1. Simpan ke DB (critical path) ──
         async with AsyncSessionLocal() as session:
             saved_ids = []
             for tx_type, tx_amount, tx_desc in transactions_to_save:
@@ -887,40 +888,11 @@ async def _do_save(update_or_query, context, user_id, from_query):
             await session.commit()
             logger.info(f"[OCR] saved {len(saved_ids)} tx(s), first_id={tx_id}")
 
-            # Record item prices for price catalog
-            try:
-                from bot.services.item_price_service import record_item_price
-                for item in result.items:
-                    await record_item_price(
-                        session=session,
-                        item_name_raw=item.name,
-                        toko=merchant,
-                        total_price=float(item.line_total),
-                        qty=float(item.qty),
-                        unit=str(item.unit or ''),
-                        transaction_date=tx_date,
-                        transaction_id=tx_id,
-                    )
-                if result.items:
-                    await session.commit()
-            except Exception as ep:
-                logger.warning(f"[PRICE] record failed: {ep}")
-
+        # ── 2. Ambil saldo (cepat, satu query) ──
         async with AsyncSessionLocal() as session2:
             saldo = await get_running_balance(session2, user_id=user_id)
 
-        # Simpan ke Google Sheets — per item
-        db_user = context.user_data.get("db_user")
-        user_name = db_user.full_name if db_user else str(user_id)
-        for tx_type, tx_amount, tx_desc in transactions_to_save:
-            await sheets_append(
-                user_id=user_id, user_name=user_name,
-                tx_type=tx_type, amount=tx_amount,
-                description=tx_desc, tx_date=tx_date,
-                source="struk",
-            )
-
-        # Pesan sukses dengan rincian item
+        # ── 3. Balas user SEGERA ──
         lines = ["✅ *Transaksi berhasil disimpan*\n"]
         if result.items:
             lines.append("🛒 *Rincian (per item):*")
@@ -940,12 +912,50 @@ async def _do_save(update_or_query, context, user_id, from_query):
             else: await update_or_query.message.reply_text(msg, parse_mode="Markdown")
         except Exception as e:
             logger.error(f"[OCR] reply after save failed: {e}")
-            # Fallback: kirim tanpa Markdown
             msg_plain = msg.replace('*', '').replace('_', '').replace('`', '')
             try:
                 if from_query: await update_or_query.message.reply_text(msg_plain)
                 else: await update_or_query.message.reply_text(msg_plain)
             except Exception: pass
+
+        # ── 4. Background tasks (non-blocking, tidak tunda reply user) ──
+        db_user = context.user_data.get("db_user")
+        user_name = db_user.full_name if db_user else str(user_id)
+
+        async def _background_tasks():
+            # Sheets sync
+            try:
+                for tx_type, tx_amount, tx_desc in transactions_to_save:
+                    await sheets_append(
+                        user_id=user_id, user_name=user_name,
+                        tx_type=tx_type, amount=tx_amount,
+                        description=tx_desc, tx_date=tx_date,
+                        source="struk",
+                    )
+            except Exception as e:
+                logger.warning(f"[OCR] sheets background failed: {e}")
+            # Item price recording
+            try:
+                from bot.services.item_price_service import record_item_price
+                async with AsyncSessionLocal() as bg_session:
+                    for item in result.items:
+                        await record_item_price(
+                            session=bg_session,
+                            item_name_raw=item.name,
+                            toko=merchant,
+                            total_price=float(item.line_total),
+                            qty=float(item.qty),
+                            unit=str(item.unit or ''),
+                            transaction_date=tx_date,
+                            transaction_id=tx_id,
+                        )
+                    if result.items:
+                        await bg_session.commit()
+            except Exception as e:
+                logger.warning(f"[PRICE] background record failed: {e}")
+
+        import asyncio
+        asyncio.create_task(_background_tasks())
 
     except Exception as e:
         tb = traceback.format_exc()

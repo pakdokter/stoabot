@@ -145,6 +145,10 @@ def create_app() -> Application:
     # Command handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    # /batal global — jika di luar conversation aktif, beri pesan aman
+    app.add_handler(CommandHandler("batal", lambda u, c: u.message.reply_text(
+        "✅ Tidak ada perintah aktif yang perlu dibatalkan."
+    )))
     app.add_handler(CommandHandler("saldo", cmd_saldo))
     app.add_handler(CommandHandler("riwayat", cmd_riwayat))
     app.add_handler(CommandHandler("ringkas", cmd_ringkas))

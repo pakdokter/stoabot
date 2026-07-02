@@ -497,3 +497,97 @@ async def show_toko_item_form(msg_or_query, context, toko: str):
     else:
         await msg_or_query.reply_text(text, parse_mode="Markdown")
     return PASAR_TABEL
+
+
+# ── /harga dan /sync_harga ────────────────────────────────────────────────────
+
+async def cmd_harga(update, context):
+    """
+    /harga [nama item] — cari harga item dari database.
+    Contoh: /harga bamer, /harga minyak goreng
+    """
+    from bot.database import AsyncSessionLocal
+    from bot.services.item_price_service import get_price_summary, get_cheapest_toko
+    from bot.utils.formatters import fmt_rupiah
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Ketik nama item yang ingin dicari harganya.\n"
+            "Contoh: `/harga bamer`\nAtau: `/harga minyak goreng`",
+            parse_mode="Markdown",
+        )
+        return
+
+    query = " ".join(args)
+    await update.message.reply_text(f"🔍 Mencari harga untuk *{_esc(query)}*...", parse_mode="Markdown")
+
+    async with AsyncSessionLocal() as session:
+        summary = await get_price_summary(session, query, months=6)
+        cheapest = await get_cheapest_toko(session, query, months=6)
+
+    if not summary:
+        await update.message.reply_text(
+            f"❌ Tidak ditemukan data harga untuk *{_esc(query)}*.\n\n"
+            "_Data harga direkam otomatis setiap transaksi baru._",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Group by item_name
+    from collections import defaultdict
+    by_item = defaultdict(list)
+    for row in summary:
+        by_item[row['item_name']].append(row)
+
+    lines = [f"💰 *Harga: {_esc(query)}*\n"]
+
+    for item_name, rows in list(by_item.items())[:3]:  # max 3 item
+        lines.append(f"📦 *{_esc(item_name.title())}*")
+        # Tampilkan 3 bulan terakhir
+        for row in rows[:3]:
+            unit_str = f"/{row['unit']}" if row.get('unit') else ""
+            lines.append(
+                f"  {row['bulan']}: "
+                f"min {fmt_rupiah(row['harga_min'])}{unit_str}, "
+                f"max {fmt_rupiah(row['harga_max'])}{unit_str}"
+            )
+        lines.append("")
+
+    if cheapest:
+        lines.append("🏪 *Toko termurah (6 bln):*")
+        for i, t in enumerate(cheapest[:3], 1):
+            lines.append(f"  {i}. {_esc(t['toko'] or '-')} — avg {fmt_rupiah(t['harga_rata'])}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_sync_harga(update, context):
+    """/sync_harga — sync katalog harga ke Google Sheets."""
+    import os
+    from bot.database import AsyncSessionLocal
+    from bot.services.item_price_service import sync_price_catalog_to_sheets
+    from bot.services.sheets import _get_client
+
+    await update.message.reply_text("⏳ Syncing katalog harga ke Sheets...")
+
+    spreadsheet_id = os.environ.get("GOOGLE_SHEET_ID")
+    if not spreadsheet_id:
+        await update.message.reply_text("❌ GOOGLE_SHEET_ID tidak dikonfigurasi.")
+        return
+
+    try:
+        client = _get_client()
+        async with AsyncSessionLocal() as session:
+            count = await sync_price_catalog_to_sheets(
+                session, client, spreadsheet_id, months=6
+            )
+        if count > 0:
+            await update.message.reply_text(
+                f"✅ *{count} baris* berhasil ditulis ke sheet *Katalog Harga*.",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text("⚠️ Tidak ada data harga untuk di-sync.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Gagal sync: {e}")

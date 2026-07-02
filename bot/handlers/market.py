@@ -370,6 +370,22 @@ async def _simpan_pasar(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 session.add(tx)
                 await session.flush()
 
+                # Record ke item_prices untuk tracking harga
+                try:
+                    from bot.services.item_price_service import record_item_price
+                    await record_item_price(
+                        session=session,
+                        item_name_raw=item['name'],
+                        toko=toko_label,
+                        total_price=float(item['total']),
+                        qty=float(item.get('qty', 1)),
+                        unit=str(item.get('unit', '')),
+                        transaction_date=tx_date,
+                        transaction_id=tx.id,
+                    )
+                except Exception as ep:
+                    logger.warning(f"[PRICE] market record failed: {ep}")
+
                 # Update katalog market_items
                 existing = await session.execute(
                     select(MarketItem).where(

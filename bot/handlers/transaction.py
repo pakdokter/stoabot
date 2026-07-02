@@ -752,6 +752,7 @@ def build_transaction_conv() -> ConversationHandler:
     from bot.handlers.market import (
         handle_toko_callback, handle_pasar_input,
         handle_pasar_konfirm, handle_pasar_manual_toko,
+        show_toko_keyboard,
         PASAR_TOKO, PASAR_TABEL, PASAR_MANUAL, PASAR_KONFIRM,
     )
     return ConversationHandler(
@@ -763,6 +764,8 @@ def build_transaction_conv() -> ConversationHandler:
             # ── Pilih toko ──
             PASAR_TOKO: [
                 CallbackQueryHandler(handle_toko_callback, pattern="^toko:"),
+                # Tampilkan ulang keyboard jika ada teks random masuk
+                MessageHandler(filters.TEXT & ~filters.COMMAND, show_toko_keyboard),
             ],
             # ── Tabel belanja pasar ──
             PASAR_TABEL: [

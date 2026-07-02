@@ -1,7 +1,8 @@
 """
-Main entrypoint — assembles all handlers and starts the bot.
+Main entrypoint -- assembles all handlers and starts the bot.
 """
 import sys
+import asyncio
 from loguru import logger
 from telegram import Update, BotCommand
 from telegram.ext import (

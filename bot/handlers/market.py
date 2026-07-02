@@ -419,20 +419,23 @@ async def _simpan_pasar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         logger.info(f"[PASAR] saved {len(saved_ids)} items, total={total_all}, uid={user_id}")
 
-        # Google Sheets — satu baris per item
-        for item, tx_id in zip(items, saved_ids):
-            desc = f"Pasar — {item['name']}"
-            try:
-                await sheets_append(
-                    user_id=user_id,
-                    user_name=update.effective_user.full_name or "",
-                    tx_type="keluar",
-                    amount=item["total"],
-                    description=desc,
-                    tx_date=tx_date,
-                )
-            except Exception as e:
-                logger.warning(f"[PASAR] Sheets append failed: {e}")
+        # Google Sheets -- background (tidak tunda reply user)
+        _items_snap = list(items)
+        _ids_snap = list(saved_ids)
+        _uname = update.effective_user.full_name or ""
+        async def _bg_sheets():
+            for item, _ in zip(_items_snap, _ids_snap):
+                desc = f"{toko_label} — {item['name']}"
+                try:
+                    await sheets_append(
+                        user_id=user_id, user_name=_uname,
+                        tx_type="keluar", amount=item["total"],
+                        description=desc, tx_date=tx_date,
+                    )
+                except Exception as e:
+                    logger.warning(f"[PASAR] Sheets failed: {e}")
+        import asyncio
+        asyncio.create_task(_bg_sheets())
 
     except Exception as e:
         logger.exception(f"[PASAR] save error: {e}")

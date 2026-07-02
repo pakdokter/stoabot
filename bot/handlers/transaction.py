@@ -751,8 +751,7 @@ async def _simpan_masuk(update_or_query, context, user_id, keterangan, from_quer
 def build_transaction_conv() -> ConversationHandler:
     from bot.handlers.market import (
         handle_toko_callback, handle_pasar_input,
-        handle_pasar_konfirm, handle_pasar_manual_toko,
-        handle_pasar_nama_toko,
+        handle_pasar_konfirm, handle_pasar_nama_toko,
         show_toko_keyboard,
         PASAR_TOKO, PASAR_TABEL, PASAR_MANUAL, PASAR_KONFIRM, PASAR_NAMA_TOKO,
     )

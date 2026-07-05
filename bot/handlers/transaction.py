@@ -345,11 +345,15 @@ async def cmd_riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return toko, item, qty
         return desc.strip(), "", 1
 
+    def _esc(t: str) -> str:
+        """Escape Markdown special chars dan strip tab."""
+        return str(t).replace('\t', ' ').replace('_', r'\_').replace('*', r'\*').replace('`', r'\`').replace('[', r'\[')
+
     SEP = "\u2501" * 20
 
     lines = [
         f"\U0001F4CB *Riwayat 7 Hari Terakhir*",
-        f"\U0001F464 {user_name}",
+        f"\U0001F464 {_esc(user_name)}",
         f"_{fmt_date(date_from)} \u2014 {fmt_date(today)}_",
         f"",
         f"Saldo Awal: *{fmt_rupiah(saldo_awal)}*",
@@ -367,11 +371,11 @@ async def cmd_riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             toko_groups[toko].append((tx, item, qty))
 
         for toko, tx_list in toko_groups.items():
-            lines.append(f"\U0001F3EA _{toko}_")
+            lines.append(f"\U0001F3EA _{_esc(toko)}_")
             for tx, item, qty in tx_list:
                 sign = "+" if tx.type == "masuk" else "-"
                 qty_str = f" x{qty}" if qty > 1 else ""
-                item_str = f" \u2014 {item}{qty_str}" if item else ""
+                item_str = f" \u2014 {_esc(item)}{qty_str}" if item else ""
                 lines.append(f"  {sign}{fmt_rupiah(tx.amount)}{item_str}")
 
         lines.append(SEP)
@@ -608,11 +612,19 @@ async def hapus_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return HAPUS_KONFIRMASI
 
-    tx_id = query.data.split(":")[1]
+    tx_id = query.data.split(":")[1] if ":" in query.data else ""
+
+    # Validate UUID before using
+    try:
+        tx_uuid = uuid.UUID(tx_id)
+    except (ValueError, AttributeError):
+        await query.edit_message_text("❌ Pilihan tidak valid.")
+        return ConversationHandler.END
+
     tg_user = update.effective_user
 
     async with AsyncSessionLocal() as session:
-        tx = await session.get(Transaction, uuid.UUID(tx_id))
+        tx = await session.get(Transaction, tx_uuid)
         if not tx or tx.is_deleted:
             await query.edit_message_text("❌ Transaksi tidak ditemukan.")
             return ConversationHandler.END

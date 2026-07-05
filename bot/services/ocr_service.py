@@ -1340,7 +1340,7 @@ def _parse_shopee_detail(text: str) -> OcrResult:
                 merchant = candidate
                 break
 
-    result.merchant = merchant or "Shopee"
+    result.merchant = (merchant or "Shopee").replace('\t', ' ').strip()
 
     # ── Ekstrak semua komponen harga ──
     def _parse_rp(pattern, src):
@@ -2548,7 +2548,7 @@ def _parse_receipt_text(text: str) -> OcrResult:
     text_lower = text.lower()
     for keyword, merchant_name in KNOWN_MERCHANTS.items():
         if keyword in text_lower:
-            result.merchant = merchant_name
+            result.merchant = merchant_name.replace('\t', ' ').strip()
             break
 
     # Override khusus: Dineta sering salah karena alamat "Stoa Space" terbaca duluan

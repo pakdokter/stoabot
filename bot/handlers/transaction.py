@@ -504,13 +504,152 @@ async def edit_pilih_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     field = query.data.split(":")[1]
     context.user_data["edit_field"] = field
 
+    if field == "date":
+        # Tampilkan kalender inline untuk bulan ini
+        return await _show_date_picker(query, context)
+
     prompts = {
         "amount": "Masukkan nominal baru:",
         "description": "Masukkan keterangan baru:",
-        "date": "Masukkan tanggal baru (DD/MM/YYYY):",
         "type": "Ketik `masuk` atau `keluar`:",
     }
-    await query.edit_message_text(prompts[field], parse_mode="Markdown")
+    await query.edit_message_text(prompts.get(field, "Masukkan nilai baru:"), parse_mode="Markdown")
+    return EDIT_NILAI
+
+
+async def _show_date_picker(query, context, year: int = None, month: int = None):
+    """Tampilkan kalender inline — hanya tanggal dalam bulan yang dipilih bisa diklik."""
+    import calendar
+    from datetime import date as _date
+    today = _date.today()
+
+    if year is None:
+        year = today.year
+    if month is None:
+        month = today.month
+
+    context.user_data["date_picker_year"] = year
+    context.user_data["date_picker_month"] = month
+
+    # Header bulan
+    bulan_nama = [
+        "", "Jan", "Feb", "Mar", "Apr", "Mei", "Jun",
+        "Jul", "Agu", "Sep", "Okt", "Nov", "Des"
+    ]
+    header = f"📅 *Pilih Tanggal — {bulan_nama[month]} {year}*"
+
+    # Navigasi bulan prev/next (max 12 bulan ke belakang)
+    prev_month = month - 1 if month > 1 else 12
+    prev_year = year if month > 1 else year - 1
+    next_month = month + 1 if month < 12 else 1
+    next_year = year if month < 12 else year + 1
+
+    # Batasi: tidak boleh ke bulan depan dari bulan ini
+    can_next = (next_year, next_month) <= (today.year, today.month)
+    # Batasi: max 12 bulan ke belakang
+    from dateutil.relativedelta import relativedelta
+    min_date = today - relativedelta(months=12)
+    can_prev = (prev_year, prev_month) >= (min_date.year, min_date.month)
+
+    nav_row = []
+    if can_prev:
+        nav_row.append(InlineKeyboardButton(
+            "◀", callback_data=f"datepick:{prev_year}:{prev_month}"
+        ))
+    else:
+        nav_row.append(InlineKeyboardButton(" ", callback_data="datepick:noop"))
+    nav_row.append(InlineKeyboardButton(
+        f"{bulan_nama[month]} {year}", callback_data="datepick:noop"
+    ))
+    if can_next:
+        nav_row.append(InlineKeyboardButton(
+            "▶", callback_data=f"datepick:{next_year}:{next_month}"
+        ))
+    else:
+        nav_row.append(InlineKeyboardButton(" ", callback_data="datepick:noop"))
+
+    # Grid tanggal
+    rows = [nav_row]
+    rows.append([InlineKeyboardButton(d, callback_data="datepick:noop")
+                 for d in ["Sen", "Sel", "Rab", "Kam", "Jum", "Sab", "Min"]])
+
+    cal = calendar.monthcalendar(year, month)
+    for week in cal:
+        row = []
+        for day in week:
+            if day == 0:
+                row.append(InlineKeyboardButton(" ", callback_data="datepick:noop"))
+            else:
+                d = _date(year, month, day)
+                is_future = d > today
+                label = f"·{day}·" if is_future else str(day)
+                cb = "datepick:noop" if is_future else f"datepick:sel:{year}:{month}:{day}"
+                row.append(InlineKeyboardButton(label, callback_data=cb))
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton("❌ Batal", callback_data="datepick:batal")])
+
+    keyboard = InlineKeyboardMarkup(rows)
+    try:
+        await query.edit_message_text(header, parse_mode="Markdown", reply_markup=keyboard)
+    except Exception:
+        pass
+    return EDIT_NILAI
+
+
+async def handle_date_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle pilihan tanggal dari kalender inline."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data  # "datepick:sel:2026:7:5" or "datepick:2026:7" or "datepick:noop"
+
+    if data == "datepick:noop":
+        return EDIT_NILAI
+
+    if data == "datepick:batal":
+        await query.edit_message_text("❌ Edit dibatalkan.")
+        return ConversationHandler.END
+
+    parts = data.split(":")
+
+    # Navigasi bulan: "datepick:YEAR:MONTH"
+    if len(parts) == 3 and parts[1].isdigit():
+        year, month = int(parts[1]), int(parts[2])
+        return await _show_date_picker(query, context, year, month)
+
+    # Pilih tanggal: "datepick:sel:YEAR:MONTH:DAY"
+    if len(parts) == 5 and parts[1] == "sel":
+        from datetime import date as _date
+        year, month, day = int(parts[2]), int(parts[3]), int(parts[4])
+        selected_date = _date(year, month, day)
+
+        tx_id = context.user_data.get("edit_tx_id")
+        if not tx_id:
+            await query.edit_message_text("⏰ Sesi habis. Gunakan /edit lagi.")
+            return ConversationHandler.END
+
+        try:
+            async with AsyncSessionLocal() as session:
+                tx = await session.get(Transaction, uuid.UUID(tx_id))
+                if not tx or tx.is_deleted:
+                    await query.edit_message_text("❌ Transaksi tidak ditemukan.")
+                    return ConversationHandler.END
+
+                from bot.services.audit import _tx_to_dict, log_update
+                old_vals = _tx_to_dict(tx)
+                tx.transaction_date = selected_date
+                await log_update(session, update.effective_user.id, old_vals, tx)
+                await session.commit()
+
+            await query.edit_message_text(
+                f"✅ Tanggal diubah ke *{fmt_date(selected_date)}*",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            await query.edit_message_text(f"❌ Gagal: {e}")
+
+        return ConversationHandler.END
+
     return EDIT_NILAI
 
 
@@ -844,7 +983,10 @@ def build_edit_conv() -> ConversationHandler:
         states={
             EDIT_PILIH: [CallbackQueryHandler(edit_pilih_tx)],
             EDIT_FIELD: [CallbackQueryHandler(edit_pilih_field)],
-            EDIT_NILAI: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_input_nilai)],
+            EDIT_NILAI: [
+                CallbackQueryHandler(handle_date_picker_callback, pattern="^datepick:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_input_nilai),
+            ],
         },
         fallbacks=[CommandHandler("batal", cmd_cancel), CallbackQueryHandler(cmd_cancel, pattern="^cancel$")],
         conversation_timeout=300,

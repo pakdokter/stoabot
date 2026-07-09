@@ -515,8 +515,15 @@ async def edit_pilih_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def edit_input_nilai(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    field = context.user_data["edit_field"]
-    tx_id = context.user_data["edit_tx_id"]
+    field = context.user_data.get("edit_field")
+    tx_id = context.user_data.get("edit_tx_id")
+
+    if not field or not tx_id:
+        await update.message.reply_text(
+            "⏰ Sesi edit habis. Gunakan /edit untuk mulai lagi."
+        )
+        return ConversationHandler.END
+
     value = update.message.text.strip()
     tg_user = update.effective_user
 
@@ -657,7 +664,15 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _p = {k: context.user_data[k] for k in ("session_verified","db_user") if k in context.user_data}
     context.user_data.clear()
     context.user_data.update(_p)
-    await update.message.reply_text("❌ Dibatalkan.")
+    msg = "❌ Dibatalkan."
+    if update.message:
+        await update.message.reply_text(msg)
+    elif update.callback_query:
+        await update.callback_query.answer()
+        try:
+            await update.callback_query.edit_message_text(msg)
+        except Exception:
+            pass
     return ConversationHandler.END
 
 

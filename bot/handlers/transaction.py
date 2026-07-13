@@ -142,7 +142,10 @@ async def handle_keterangan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_tanggal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle tombol Hari ini / Tgl lain."""
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass
     data = query.data  # "tanggal:hari_ini" atau "tanggal:lain"
 
     if data == "tanggal:hari_ini":
@@ -458,7 +461,10 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def edit_pilih_tx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass
 
     if query.data in ("cancel", "edit_selesai"):
         await query.edit_message_text("✅ Selesai.")
@@ -495,7 +501,10 @@ async def edit_pilih_tx(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def edit_pilih_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass
 
     if query.data == "cancel":
         await query.edit_message_text("❌ Edit dibatalkan.")
@@ -592,15 +601,19 @@ async def _show_date_picker(query, context, year: int = None, month: int = None)
     keyboard = InlineKeyboardMarkup(rows)
     try:
         await query.edit_message_text(header, parse_mode="Markdown", reply_markup=keyboard)
-    except Exception:
-        pass
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            pass  # Ignore "not modified" silently
     return EDIT_NILAI
 
 
 async def handle_date_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle pilihan tanggal dari kalender inline."""
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass
     data = query.data  # "datepick:sel:2026:7:5" or "datepick:2026:7" or "datepick:noop"
 
     if data == "datepick:noop":
@@ -738,7 +751,10 @@ async def cmd_hapus(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def hapus_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass
 
     if query.data in ("cancel", "hapus_selesai"):
         await query.edit_message_text("✅ Selesai.")

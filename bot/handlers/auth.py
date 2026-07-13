@@ -22,7 +22,7 @@ from bot.database import AsyncSessionLocal
 from bot.models import User
 from bot.config import settings
 
-SESSION_TIMEOUT_HOURS = 24
+SESSION_TIMEOUT_HOURS = 24 * 7  # 7 hari — diperpanjang agar tidak perlu login ulang setiap hari
 WAITING_USERNAME = 10
 WAITING_PASSWORD = 11
 
@@ -72,10 +72,25 @@ async def ensure_registered(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             user = await session.get(User, user_id)
 
         if user and user.is_active and user.pin:
-            # Cek last_seen — sesi 24 jam
+            # Cek last_seen — sesi 7 hari
             now = datetime.now(timezone.utc)
             if user.last_seen and (now - user.last_seen) < timedelta(hours=SESSION_TIMEOUT_HOURS):
-                context.user_data["db_user"] = user
+                # Rolling session: update last_seen max sekali per jam agar timer reset
+                needs_update = (
+                    not user.last_seen or
+                    (now - user.last_seen) > timedelta(hours=1)
+                )
+                if needs_update:
+                    async with AsyncSessionLocal() as session2:
+                        user2 = await session2.get(User, user_id)
+                        if user2:
+                            user2.last_seen = now
+                            await session2.commit()
+                            context.user_data["db_user"] = user2
+                        else:
+                            context.user_data["db_user"] = user
+                else:
+                    context.user_data["db_user"] = user
                 context.user_data["session_verified"] = True
                 return True
 

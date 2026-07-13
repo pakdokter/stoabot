@@ -17,6 +17,9 @@ Format struk fisik:
   Format F : nama item, lalu "Nx HARGA TOTAL" (lowercase x, spasi setelah x)
              Mendukung OCR ter-join satu baris panjang (mode one-liner)
              (Harnila Store, kasir app generic)
+  Format I : nama item, lalu "N PCS/BH X HARGA = TOTAL", lalu opsional "Disc -X"
+             Total dari "Total : NNN" (bukan Sub Total, bukan Chrge Krtu/Byar Debit)
+             (SB Minimarket / Sinar Bahagia Pancor)
   Format G : invoice tabel kolom, format IDR titik-koma (NNN.NNN,00)
              Item: QTY UNIT SKU NAMA Rp UNIT_PRICE Rp AMOUNT
              Total dari "Invoice Total : Rp NNN.NNN,00"
@@ -108,6 +111,8 @@ PAYMENT_KEYWORDS = [
     r'\bqris\b', r'\bova\b', r'\bgopay\b', r'\bshopee\b',
     r'\bdana\b', r'\blinkaja\b', r'\bbrimo\b', r'\bbri\s+brimo\b',
     r'\bshopeepay\b', r'\bovo\b', r'\bmandiri\b',
+    # SB Minimarket specific
+    r'\bchrge\s+krtu\b', r'\bbyar\s+debit\b', r'\banda\s+hemat\b',
     # OCR noise variants
     r'\brunai\b', r'\btunal\b', r'\btumai\b', r'\bbayaf\b',
     r'\btuna\s+i\b', r'\btunail\b',
@@ -2238,6 +2243,105 @@ def _parse_items_format_h(lines: list) -> list:
 
 
 
+
+def _is_format_i(lines: list) -> bool:
+    """
+    Format I -- SB Minimarket / Sinar Bahagia Pancor.
+    Ciri khas: baris "N PCS X HARGA =" atau "N BH X HARGA ="
+    diikuti opsional "Disc -NNN", lalu total dari "Total : NNN"
+    """
+    for line in lines:
+        if re.match(r'^\d+\s+(PCS|BH|BTL|PCK|DOS|LBR|SET|BKS)\s+X\s+[\d.,]+\s*=', line.strip(), re.IGNORECASE):
+            return True
+    return False
+
+
+def _parse_items_format_i(lines: list) -> list:
+    """
+    Parse Format I -- SB Minimarket.
+
+    Pola per item:
+      NAMA ITEM [VARIAN]             <- baris nama
+      1 PCS X  8,500 =    8,500     <- baris qty x harga = total
+      Disc   -1,500                  <- opsional diskon per item
+
+    Total struk: baris "Total : 83,750" (bukan Sub Total, bukan Chrge Krtu)
+    """
+    SKIP_SB = re.compile(
+        r'^(tgl|kasir|user|no|sc)\s*:', re.IGNORECASE
+    )
+    QTY_PATTERN = re.compile(
+        r'^(\d+)\s+(PCS|BH|BTL|PCK|DOS|LBR|SET|BKS)\s+X\s+([\d.,]+)\s*=\s*([\d.,]+)',
+        re.IGNORECASE
+    )
+    DISC_PATTERN = re.compile(r'^Disc\s+[-+]?([\d.,]+)', re.IGNORECASE)
+
+    items = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+
+        # Skip header/footer baris
+        if SKIP_SB.match(line):
+            i += 1
+            continue
+
+        # Deteksi baris qty: "1 PCS X 8,500 = 8,500"
+        qty_m = QTY_PATTERN.match(line)
+        if qty_m:
+            qty = float(qty_m.group(1))
+            unit = qty_m.group(2).upper()
+            line_total_raw = qty_m.group(4).replace('.', '').replace(',', '')
+            line_total = float(line_total_raw) if line_total_raw.isdigit() else 0.0
+            unit_price_raw = qty_m.group(3).replace('.', '').replace(',', '')
+            unit_price = float(unit_price_raw) if unit_price_raw.isdigit() else 0.0
+
+            # Cek disc di baris berikutnya
+            disc = 0.0
+            if i + 1 < len(lines):
+                disc_m = DISC_PATTERN.match(lines[i + 1].strip())
+                if disc_m:
+                    disc_raw = disc_m.group(1).replace('.', '').replace(',', '')
+                    disc_candidate = float(disc_raw) if disc_raw.isdigit() else 0.0
+                    # Hanya kurangi disc jika total di baris qty = harga × qty (belum dikurangi)
+                    # Jika total sudah lebih kecil dari harga×qty, disc sudah termasuk
+                    expected_total = unit_price * qty
+                    already_discounted = abs(expected_total - line_total) > 1
+                    if not already_discounted:
+                        disc = disc_candidate
+                    i += 1  # skip baris disc
+
+            net_total = line_total - disc
+
+            # Ambil nama dari baris sebelumnya
+            name = None
+            j = i - 1
+            while j >= 0:
+                prev = lines[j].strip()
+                if (len(prev) >= 3 and
+                    not QTY_PATTERN.match(prev) and
+                    not DISC_PATTERN.match(prev) and
+                    not SKIP_SB.match(prev) and
+                    not re.match(r'^[=\-]{3,}', prev) and
+                    not re.match(r'^(sub\s*total|total|chrge|byar|anda\s+hemat)', prev, re.IGNORECASE)):
+                    name = prev
+                    break
+                j -= 1
+
+            if name and net_total >= 100:
+                items.append(ReceiptItem(
+                    name=name.upper()[:60],
+                    qty=qty,
+                    unit=unit,
+                    unit_price=unit_price,
+                    line_total=net_total,
+                ))
+
+        i += 1
+    return items
+
+
+
 def _is_dineta_invoice(text: str) -> bool:
     """Deteksi invoice PT Dineta Jaya."""
     return bool(re.search(r'dineta', text, re.IGNORECASE)) and bool(re.search(r'invoice', text, re.IGNORECASE))
@@ -2743,11 +2847,13 @@ def _parse_receipt_text(text: str) -> OcrResult:
     # 2. MR D.I.Y. (nama → SKU → barcode+harga)
     # 3. Format F (Harnila: "Nx HARGA  TOTAL")
     # 4. Format H (Dapur Kita: nama + "N SET X harga(diskon)")
-    # 5. Format A/B (fallback)
+    # 5. Format I (SB Minimarket: nama + "N PCS X HARGA = TOTAL" + opsional Disc)
+    # 6. Format A/B (fallback)
     items_fadhilah = _parse_items_format_fadhilah(lines) if _is_fadhilah_format(lines) else []
     items_mrdiy = _parse_items_format_mrdiy(lines)
     items_f = _parse_items_format_f(lines) if _is_format_f(lines) else []
     items_h = _parse_items_format_h(lines) if _is_format_h(lines) else []
+    items_i = _parse_items_format_i(lines) if _is_format_i(lines) else []
 
     if items_fadhilah:
         items = items_fadhilah
@@ -2755,6 +2861,8 @@ def _parse_receipt_text(text: str) -> OcrResult:
         items = items_mrdiy
     elif items_f:
         items = items_f
+    elif items_i:
+        items = items_i
     elif items_h:
         items = items_h
     elif items_mrdiy and len(items_mrdiy) >= 1:

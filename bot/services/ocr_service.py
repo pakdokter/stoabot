@@ -1367,89 +1367,151 @@ def _parse_shopee_detail(text: str) -> OcrResult:
     result.total = total_pesanan
 
     # ── Parse items produk ──
+    # ── Noise dari thumbnail gambar produk ──
+    # OCR membaca teks di dalam gambar thumbnail (label produk, merk, dll)
+    # Ciri: teks pendek (< 6 kata), muncul SEBELUM nama item sebenarnya,
+    # sering mengandung nama brand/merk berulang atau kata-kata acak
+    # Solusi: anchor detection -- nama item valid harus diikuti oleh:
+    # - baris varian (ukuran/warna/qty kecil), ATAU
+    # - baris "x1"/"x2", ATAU
+    # - baris "Rp..."
+    # Teks thumbnail tidak punya anchor ini.
+
     SKIP_KEYWORDS = re.compile(
         r'subtotal|total|tunai|kembali|diskon|voucher|pengiriman|layanan|'
         r'butuh|bantuan|hubungi|batalkan|penjual|spx|jne|sicepat|anteraja|'
-        r'jnt|ninja|flash|alamat|lihat|star\+|mall|ori|standard|express|'
-        r'pesanan|dibuat|menunggu|sedang|diantarkan|transit|kurir',
+        r'jnt|ninja|flash|alamat|lihat|star\+|mall\s*\|?\s*ori|standard|express|'
+        r'pesanan|dibuat|menunggu|sedang|diantarkan|transit|kurir|'
+        r'termurah|kemasan|terlaris|terbaru|flash\s*sale|bebas\s*ongkir',
         re.IGNORECASE
     )
 
-    items_raw = []  # list of (name, qty, price_per_item)
+    # Pola yang mengindikasikan baris varian (bukan nama item)
+    VARIANT_PATTERN = re.compile(
+        r'^\d+\s*(kg|gr|gram|ml|liter|ltr|pcs|pack|btl|cm|mm|lusin|dus|karton|'
+        r'gr|ons|buah|biji|lembar|helai|pasang|set|unit|box)\s*$',
+        re.IGNORECASE
+    )
+
+    def _is_qty_line(s):
+        return bool(re.match(r'^[xX]\s*\d+$', s.strip()))
+
+    def _is_price_line(s):
+        return bool(re.match(r'^Rp[\d.,\s]+', s.strip()))
+
+    def _is_name_candidate(s):
+        """Apakah baris ini kandidat nama item? Bukan thumbnail noise."""
+        if len(s) < 4: return False
+        if SKIP_KEYWORDS.search(s): return False
+        if _is_qty_line(s): return False
+        if _is_price_line(s): return False
+        if VARIANT_PATTERN.match(s.strip()): return False
+        # Nama item biasanya mengandung huruf, bukan hanya angka/simbol
+        if not re.search(r'[A-Za-z]{2,}', s): return False
+        return True
+
+    items_raw = []
     i = 0
     while i < len(lines):
-        line = lines[i]
-        if SKIP_KEYWORDS.search(line):
-            i += 1
-            continue
-        if merchant and merchant.lower() in line.lower():
-            i += 1
-            continue
+        line = lines[i].strip()
 
-        # Ekstrak nama item
-        if '\t' in line:
-            parts = [p.strip() for p in line.split('\t') if p.strip()]
-            valid = [p for p in parts
-                     if len(p) >= 4
-                     and not re.match(r'^Rp', p)
-                     and not SKIP_KEYWORDS.search(p)
-                     and not re.match(r'^[xX]\d+$', p)]
-            name_raw = max(valid, key=len) if valid else parts[0]
-        else:
-            name_raw = line
-
-        # Bersihkan nama
-        name_raw = re.sub(r'^[A-Za-z]{2,6}\s*[-\.]+\s*', '', name_raw)
-        name_raw = re.sub(r'^\d+\.\s*', '', name_raw)
-        name_raw = re.sub(r'^[•·\-]+\s*', '', name_raw)
-        name_raw = re.sub(r'\t.*$', '', name_raw)
-        name_raw = re.sub(r'\s*\.{3}\s*$', '', name_raw).strip()
-        name_raw = re.sub(r'[…]+\s*$', '', name_raw).strip()
-
-        if len(name_raw) < 4 or SKIP_KEYWORDS.search(name_raw):
+        # Skip merchant name line
+        if merchant and merchant.replace('>', '').strip().lower() in line.lower():
             i += 1
             continue
 
-        # Cari qty dan harga
+        # Cari nama item yang valid
+        if not _is_name_candidate(line):
+            i += 1
+            continue
+
+        # Bersihkan kandidat nama
+        name_raw = line
+        # Hapus teks dalam tab (ambil bagian terpanjang)
+        if '\t' in name_raw:
+            parts = [p.strip() for p in name_raw.split('\t')]
+            valid_parts = [p for p in parts if _is_name_candidate(p)]
+            name_raw = max(valid_parts, key=len) if valid_parts else parts[0]
+
+        name_raw = re.sub(r'\s*\.{3,}$', '', name_raw).strip()  # hapus "..."
+        name_raw = re.sub(r'[…]+$', '', name_raw).strip()
+        name_raw = re.sub(r'^[•·\-]+\s*', '', name_raw).strip()
+
+        # Peek ke depan: nama item HARUS diikuti varian atau qty atau harga
+        # dalam 3 baris berikutnya
+        j = i + 1
+        has_anchor = False
+        peek_limit = min(j + 4, len(lines))
+        for k in range(j, peek_limit):
+            nxt = lines[k].strip()
+            if _is_qty_line(nxt) or _is_price_line(nxt) or VARIANT_PATTERN.match(nxt):
+                has_anchor = True
+                break
+            if SKIP_KEYWORDS.search(nxt):
+                break
+
+        if not has_anchor:
+            # Bukan nama item -- kemungkinan teks thumbnail, skip
+            i += 1
+            continue
+
+        # Ambil qty dan harga
         qty = 1
         price = None
-        j = i + 1
 
         while j < len(lines):
             nxt = lines[j].strip()
-            if re.match(r'^[xX]\d+$', nxt):
-                qty = int(re.match(r'^[xX](\d+)$', nxt).group(1))
+
+            # Baris qty: "x1", "x2", "x4"
+            if _is_qty_line(nxt):
+                qty = int(re.search(r'\d+', nxt).group())
                 j += 1
                 break
-            if re.match(r'^Rp[\d.,\s]+', nxt) or SKIP_KEYWORDS.search(nxt):
+
+            # Baris harga: "Rp290.000"
+            if _is_price_line(nxt):
                 break
+
+            # Baris varian: "1 kg", "500g", "1000 GR" -- lewati, jangan tambah ke nama
+            if VARIANT_PATTERN.match(nxt):
+                j += 1
+                continue
+
+            # Baris qty inline: "1 kg   x4"
             qty_inline = re.search(r'[xX](\d+)\s*$', nxt)
             if qty_inline:
                 qty = int(qty_inline.group(1))
-                ext = re.sub(r'\s*[xX]\d+\s*$', '', nxt).strip()
-                if ext and not SKIP_KEYWORDS.search(ext):
-                    name_raw = (name_raw + ' ' + ext).strip()
                 j += 1
                 break
-            if not SKIP_KEYWORDS.search(nxt) and len(nxt) >= 2 and not re.match(r'^\d+\s*(kg|gr|pcs|ml|ltr)', nxt, re.IGNORECASE):
+
+            # Baris tambahan nama (lanjutan dari nama terpotong) -- hati-hati
+            # Hanya tambahkan jika sangat pendek DAN bukan thumbnail noise
+            if _is_name_candidate(nxt) and len(nxt) <= 20:
                 name_raw = (name_raw + ' ' + nxt).strip()
                 j += 1
             else:
                 break
 
-        # Ambil harga item (harga asli, sebelum voucher)
+        # Ambil harga
         if j < len(lines):
             price_line = lines[j].strip()
-            prices_m = re.findall(r'Rp([\d.,]+)', price_line)
-            if prices_m:
-                # Ambil harga TERAKHIR (setelah diskon jika ada dua harga)
-                raw = prices_m[-1].replace('.', '').replace(',', '')
-                if raw.isdigit():
-                    price = float(raw)
+            if _is_price_line(price_line):
+                prices_m = re.findall(r'Rp([\d.,]+)', price_line)
+                if prices_m:
+                    raw = prices_m[-1].replace('.', '').replace(',', '')
+                    if raw.isdigit():
+                        price = float(raw)
                 j += 1
 
         if name_raw and len(name_raw) >= 3 and price and price >= 100:
-            items_raw.append({'name': name_raw, 'qty': float(qty), 'price': price})
+            # Dedup: jangan tambahkan jika nama terlalu mirip dengan item sebelumnya
+            is_dup = any(
+                name_raw.lower()[:15] in prev['name'].lower() or
+                prev['name'].lower()[:15] in name_raw.lower()
+                for prev in items_raw
+            )
+            if not is_dup:
+                items_raw.append({'name': name_raw, 'qty': float(qty), 'price': price})
             i = j
         else:
             i += 1

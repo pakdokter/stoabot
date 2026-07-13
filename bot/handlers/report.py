@@ -234,13 +234,46 @@ async def cmd_statement(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_registered(update, context):
         return ConversationHandler.END
 
-    today = date.today()
+    user_id = update.effective_user.id
+    is_admin = user_id in settings.admin_ids
 
-    # Buat tombol 6 bulan terakhir + opsi bulan lain
+    # Admin: tampilkan pilihan user dulu
+    if is_admin:
+        async with AsyncSessionLocal() as session:
+            from sqlalchemy import select as _sel
+            result = await session.execute(
+                _sel(User).where(User.is_active == True).order_by(User.full_name)
+            )
+            all_users = result.scalars().all()
+
+        rows = [[InlineKeyboardButton(
+            f"👤 Semua User", callback_data="stmt_user:all"
+        )]]
+        for u in all_users:
+            rows.append([InlineKeyboardButton(
+                f"{'👤' if u.id in settings.admin_ids else '🧑'} {u.full_name}",
+                callback_data=f"stmt_user:{u.id}"
+            )])
+
+        await update.message.reply_text(
+            "📄 *E-Statement PDF*\n\nPilih user:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return STMT_BULAN
+
+    # Staff biasa: langsung ke pilihan bulan (hanya data sendiri)
+    context.user_data["stmt_target_user_id"] = user_id
+    return await _show_month_picker(update.message, context)
+
+
+async def _show_month_picker(msg_or_reply, context):
+    """Tampilkan picker bulan untuk statement."""
+    from dateutil.relativedelta import relativedelta
+    today = date.today()
     buttons = []
     row = []
     for i in range(5, -1, -1):
-        from dateutil.relativedelta import relativedelta
         d = today - relativedelta(months=i)
         label = d.strftime("%b %Y")
         cb = f"stmt:{d.month}:{d.year}"
@@ -252,12 +285,43 @@ async def cmd_statement(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons.append(row)
     buttons.append([InlineKeyboardButton("✏️ Bulan lain", callback_data="stmt:other")])
 
-    await update.message.reply_text(
-        "📄 *E-Statement PDF*\n\nPilih bulan:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
+    target_id = context.user_data.get("stmt_target_user_id")
+    target_name = context.user_data.get("stmt_target_name", "")
+    header = f"📄 *E-Statement PDF*"
+    if target_name and target_name != "all":
+        header += f"\n👤 {target_name}"
+    elif target_name == "all":
+        header += "\n👥 Semua User"
+    header += "\n\nPilih bulan:"
+
+    kwargs = dict(text=header, parse_mode="Markdown",
+                  reply_markup=InlineKeyboardMarkup(buttons))
+    if hasattr(msg_or_reply, 'edit_message_text'):
+        await msg_or_reply.edit_message_text(**kwargs)
+    else:
+        await msg_or_reply.reply_text(**kwargs)
     return STMT_BULAN
+
+
+async def stmt_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin memilih user untuk statement."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data  # "stmt_user:all" atau "stmt_user:123456789"
+    target = data.split(":")[1]
+
+    if target == "all":
+        context.user_data["stmt_target_user_id"] = "all"
+        context.user_data["stmt_target_name"] = "all"
+    else:
+        target_id = int(target)
+        context.user_data["stmt_target_user_id"] = target_id
+        async with AsyncSessionLocal() as session:
+            u = await session.get(User, target_id)
+            context.user_data["stmt_target_name"] = u.full_name if u else str(target_id)
+
+    return await _show_month_picker(query, context)
 
 
 async def stmt_bulan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -311,22 +375,48 @@ async def stmt_tahun(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await stmt_bulan(update, context)
 
 
-async def _generate_statement(update_or_query, context: ContextTypes.DEFAULT_TYPE):
+async def _generate_statement(update_or_query, context):
     month = context.user_data["stmt_month"]
     year = context.user_data["stmt_year"]
-    # Support both Update (message) dan CallbackQuery
-    if hasattr(update_or_query, 'effective_user'):
-        user_id = update_or_query.effective_user.id
+    target_user_id = context.user_data.get("stmt_target_user_id")
+
+    if hasattr(update_or_query, "effective_user"):
+        caller_id = update_or_query.effective_user.id
         reply_target = update_or_query.message
     else:
-        user_id = update_or_query.from_user.id
+        caller_id = update_or_query.from_user.id
         reply_target = update_or_query.message
+
+    if not target_user_id:
+        target_user_id = caller_id
+
     date_from = date(year, month, 1)
     last_day = monthrange(year, month)[1]
     date_to = date(year, month, last_day)
 
-    await reply_target.reply_text("⏳ Membuat PDF statement...")
+    if target_user_id == "all":
+        await reply_target.reply_text("⏳ Membuat PDF untuk semua user...")
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(User).where(User.is_active == True).order_by(User.full_name)
+            )
+            all_users = result.scalars().all()
+        for u in all_users:
+            await _generate_single_statement(reply_target, u.id, u.full_name,
+                                              date_from, date_to, month, year)
+        return ConversationHandler.END
 
+    await reply_target.reply_text("⏳ Membuat PDF statement...")
+    async with AsyncSessionLocal() as session:
+        _u = await session.get(User, target_user_id)
+        user_name = _u.full_name if _u else str(target_user_id)
+    await _generate_single_statement(reply_target, target_user_id, user_name,
+                                     date_from, date_to, month, year)
+    return ConversationHandler.END
+
+
+async def _generate_single_statement(reply_target, user_id, user_name,
+                                      date_from, date_to, month, year):
     async with AsyncSessionLocal() as session:
         result = await session.execute(
             select(Transaction)
@@ -339,40 +429,30 @@ async def _generate_statement(update_or_query, context: ContextTypes.DEFAULT_TYP
             .order_by(Transaction.transaction_date)
         )
         txs = result.scalars().all()
-
-        pre_summary = await get_summary(
-            session, user_id=user_id,
-            date_to=date_from - timedelta(days=1)
-        )
+        pre_summary = await get_summary(session, user_id=user_id,
+                                        date_to=date_from - timedelta(days=1))
         saldo_awal = pre_summary["saldo"]
 
-    # Ambil nama user dulu sebelum generate PDF
-    from bot.database import AsyncSessionLocal as _ASL
-    from bot.models import User as _User
-    async with _ASL() as _s:
-        _u = await _s.get(_User, user_id)
-        user_name = _u.full_name if _u else str(user_id)
+    if not txs:
+        await reply_target.reply_text(
+            f"\U0001f4ed *{user_name}*: Tidak ada transaksi di "
+            f"{date_from.strftime('%B %Y')}.",
+            parse_mode="Markdown",
+        )
+        return
 
     try:
         pdf_bytes = generate_statement_pdf(txs, date_from, date_to, saldo_awal, user_name=user_name)
-        filename = f"statement_{year}_{month:02d}.pdf"
-
+        filename = f"statement_{user_name.replace(' ', '_')}_{year}_{month:02d}.pdf"
         await reply_target.reply_document(
             document=io.BytesIO(pdf_bytes),
             filename=filename,
-            caption=f"📄 E-Statement {date_from.strftime('%B %Y')} — {user_name}",
+            caption=f"\U0001f4c4 E-Statement {date_from.strftime('%B %Y')} — {user_name}",
         )
     except Exception as e:
-        logger.error(f"PDF generation failed: {e}")
-        await reply_target.reply_text("❌ Gagal membuat PDF. Coba lagi.")
+        logger.error(f"PDF generation failed for {user_name}: {e}")
+        await reply_target.reply_text(f"❌ Gagal generate PDF untuk {user_name}: {e}")
 
-    _p = {k: context.user_data[k] for k in ("session_verified", "db_user") if k in context.user_data}
-    context.user_data.clear()
-    context.user_data.update(_p)
-    return ConversationHandler.END
-
-
-# ── Cancel ────────────────────────────────────────────────────────────
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _p = {k: context.user_data[k] for k in ("session_verified", "db_user") if k in context.user_data}
@@ -409,6 +489,7 @@ def build_statement_conv() -> ConversationHandler:
         entry_points=[CommandHandler("statement", cmd_statement)],
         states={
             STMT_BULAN: [
+                CallbackQueryHandler(stmt_user_callback, pattern="^stmt_user:"),
                 CallbackQueryHandler(stmt_bulan_callback, pattern="^stmt:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, stmt_bulan),
             ],

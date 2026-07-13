@@ -176,6 +176,7 @@ def create_app() -> Application:
     app.add_handler(CommandHandler("ringkas", cmd_ringkas))
     app.add_handler(CommandHandler("harga", cmd_harga))
     app.add_handler(CommandHandler("sync_harga", cmd_sync_harga))
+    app.add_handler(CommandHandler("refresh_katalog", cmd_refresh_katalog))
     app.add_handler(build_laporan_teks_conv())
     app.add_handler(CommandHandler("cari", cmd_cari))
     # Auth commands

@@ -350,7 +350,28 @@ async def cmd_riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     def _esc(t: str) -> str:
         """Escape Markdown special chars dan strip tab."""
-        return str(t).replace('\t', ' ').replace('_', r'\_').replace('*', r'\*').replace('`', r'\`').replace('[', r'\[')
+        return (str(t)
+                .replace('\t', ' ')
+                .replace('\\', '')
+                .replace('_', r'\_')
+                .replace('*', r'\*')
+                .replace('`', r'\`')
+                .replace('[', r'\[')
+                .replace(']', r'\]')
+                .replace('(', r'\(')
+                .replace(')', r'\)')
+                .replace('~', r'\~')
+                .replace('>', r'\>')
+                .replace('#', r'\#')
+                .replace('+', r'\+')
+                .replace('-', r'\-')
+                .replace('=', r'\=')
+                .replace('|', r'\|')
+                .replace('{', r'\{')
+                .replace('}', r'\}')
+                .replace('.', r'\.')
+                .replace('!', r'\!')
+                )
 
     SEP = "\u2501" * 20
 
@@ -393,7 +414,12 @@ async def cmd_riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(text) > 4000:
         text = text[:3950] + "\n\n_...terpotong, gunakan /laporan untuk detail_"
 
-    await update.message.reply_text(text, parse_mode="Markdown")
+    try:
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception as e:
+        logger.warning(f"[RIWAYAT] Markdown failed: {e}, falling back to plain text")
+        plain = text.replace('*', '').replace('_', '').replace('`', '').replace('\\', '')
+        await update.message.reply_text(plain)
 
 # ──────────────────────────────────────────────
 # /cari

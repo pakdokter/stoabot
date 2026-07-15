@@ -32,7 +32,8 @@ from bot.handlers.auth import ensure_registered
     HAPUS_KONFIRMASI,
     TX_SUMBER_LAINNYA,
     TX_TANGGAL_MANUAL,
-) = range(9)
+    EDIT_BULAN,
+) = range(10)
 
 SUMBER_MASUK = ["Bank Biru", "Kasir", "Lainnya"]
 
@@ -468,19 +469,102 @@ async def cmd_cari(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_registered(update, context):
         return ConversationHandler.END
+    return await _show_edit_month_picker(update.message, context)
 
-    user_id = update.effective_user.id
-    async with AsyncSessionLocal() as session:
-        txs = await _recent_transactions(session, 10, user_id=user_id)
 
-    if not txs:
-        await update.message.reply_text("Tidak ada transaksi untuk diedit.")
+async def _show_edit_month_picker(msg_or_query, context, is_hapus: bool = False):
+    """Tampilkan picker bulan untuk edit/hapus."""
+    from dateutil.relativedelta import relativedelta
+    today = date.today()
+    buttons = []
+    row = []
+    for i in range(5, -1, -1):
+        d = today - relativedelta(months=i)
+        label = d.strftime("%b %Y")
+        cb = f"editbulan:{d.year}:{d.month}:{'hapus' if is_hapus else 'edit'}"
+        row.append(InlineKeyboardButton(label, callback_data=cb))
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("❌ Batal", callback_data="cancel")])
+
+    prefix = "🗑️ *Hapus*" if is_hapus else "✏️ *Edit*"
+    kwargs = dict(
+        text=f"{prefix} Transaksi\n\nPilih bulan:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    if hasattr(msg_or_query, 'edit_message_text'):
+        await msg_or_query.edit_message_text(**kwargs)
+    else:
+        await msg_or_query.reply_text(**kwargs)
+    return EDIT_BULAN
+
+
+async def edit_pilih_bulan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User pilih bulan, tampilkan semua transaksi bulan itu."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "cancel":
+        await query.edit_message_text("❌ Dibatalkan.")
         return ConversationHandler.END
 
-    await update.message.reply_text(
-        "✏️ *Edit Transaksi*\nPilih transaksi yang ingin diubah:",
-        reply_markup=_tx_inline_keyboard(txs),
+    parts = data.split(":")
+    year, month, mode = int(parts[1]), int(parts[2]), parts[3]
+    context.user_data["edit_mode"] = mode
+    context.user_data["edit_bulan_year"] = year
+    context.user_data["edit_bulan_month"] = month
+
+    user_id = update.effective_user.id
+
+    # Ambil semua transaksi bulan itu
+    from calendar import monthrange
+    last_day = monthrange(year, month)[1]
+    date_from = date(year, month, 1)
+    date_to = date(year, month, last_day)
+
+    async with AsyncSessionLocal() as session:
+        from sqlalchemy import select as _sel
+        result = await session.execute(
+            _sel(Transaction)
+            .where(
+                Transaction.user_id == user_id,
+                Transaction.is_deleted == False,
+                Transaction.transaction_date >= date_from,
+                Transaction.transaction_date <= date_to,
+            )
+            .order_by(Transaction.transaction_date.asc(), Transaction.created_at.asc())
+        )
+        txs = result.scalars().all()
+
+    if not txs:
+        bulan_nama = date_from.strftime("%B %Y")
+        await query.edit_message_text(
+            f"📭 Tidak ada transaksi di {bulan_nama}."
+        )
+        return ConversationHandler.END
+
+    # Tampilkan semua transaksi bulan itu
+    rows = []
+    for tx in txs:
+        sym = "➕" if tx.type == "masuk" else "➖"
+        desc = (tx.description or "")[:25]
+        label = f"{sym} {fmt_date(tx.transaction_date)} {desc} {fmt_rupiah(tx.amount)}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"edittx:{tx.id}")])
+
+    rows.append([InlineKeyboardButton("◀ Ganti bulan", callback_data="editback:bulan")])
+    rows.append([InlineKeyboardButton("❌ Batal", callback_data="cancel")])
+
+    mode_label = "dihapus" if mode == "hapus" else "diedit"
+    bulan_nama = date_from.strftime("%B %Y")
+    await query.edit_message_text(
+        f"{'🗑️' if mode=='hapus' else '✏️'} *{bulan_nama}* — {len(txs)} transaksi\nPilih yang ingin {mode_label}:",
         parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(rows),
     )
     return EDIT_PILIH
 
@@ -492,26 +576,27 @@ async def edit_pilih_tx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    if query.data in ("cancel", "edit_selesai"):
+    data = query.data
+
+    if data == "cancel":
+        await query.edit_message_text("❌ Dibatalkan.")
+        return ConversationHandler.END
+
+    if data in ("edit_lagi", "editback:bulan"):
+        return await _show_edit_month_picker(query, context)
+
+    if data == "edit_selesai":
         await query.edit_message_text("✅ Selesai.")
         return ConversationHandler.END
 
-    if query.data == "edit_lagi":
-        # Tampilkan ulang daftar transaksi untuk diedit
-        user_id = update.effective_user.id
-        async with AsyncSessionLocal() as session:
-            txs = await _recent_transactions(session, 10, user_id=user_id)
-        if not txs:
-            await query.edit_message_text("Tidak ada transaksi.")
-            return ConversationHandler.END
-        await query.edit_message_text(
-            "✏️ *Edit Transaksi*\nPilih transaksi yang ingin diubah:",
-            reply_markup=_tx_inline_keyboard(txs),
-            parse_mode="Markdown",
-        )
+    if data.startswith("editbulan:"):
+        return await edit_pilih_bulan(update, context)
+
+    # Pilih transaksi spesifik
+    if not data.startswith("edittx:"):
         return EDIT_PILIH
 
-    tx_id = query.data.split(":")[1]
+    tx_id = data.split(":")[1]
     context.user_data["edit_tx_id"] = tx_id
 
     keyboard = InlineKeyboardMarkup([
@@ -740,7 +825,7 @@ async def edit_input_nilai(update: Update, context: ContextTypes.DEFAULT_TYPE):
         saldo = await get_running_balance(session, user_id=tg_user.id)
 
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✏️ Edit lagi", callback_data="edit_lagi"),
+        InlineKeyboardButton("✏️ Edit lagi", callback_data="editback:bulan"),
         InlineKeyboardButton("✅ Selesai", callback_data="edit_selesai"),
     ]])
     await update.message.reply_text(
@@ -758,21 +843,7 @@ async def edit_input_nilai(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_hapus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_registered(update, context):
         return ConversationHandler.END
-
-    user_id = update.effective_user.id
-    async with AsyncSessionLocal() as session:
-        txs = await _recent_transactions(session, 10, user_id=user_id)
-
-    if not txs:
-        await update.message.reply_text("Tidak ada transaksi untuk dihapus.")
-        return ConversationHandler.END
-
-    await update.message.reply_text(
-        "🗑️ *Hapus Transaksi*\nPilih transaksi yang ingin dihapus:",
-        reply_markup=_tx_inline_keyboard(txs),
-        parse_mode="Markdown",
-    )
-    return HAPUS_KONFIRMASI
+    return await _show_edit_month_picker(update.message, context, is_hapus=True)
 
 
 async def hapus_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -786,19 +857,11 @@ async def hapus_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("✅ Selesai.")
         return ConversationHandler.END
 
-    if query.data == "hapus_lagi":
-        user_id = update.effective_user.id
-        async with AsyncSessionLocal() as session:
-            txs = await _recent_transactions(session, 10, user_id=user_id)
-        if not txs:
-            await query.edit_message_text("Tidak ada transaksi.")
-            return ConversationHandler.END
-        await query.edit_message_text(
-            "🗑️ *Hapus Transaksi*\nPilih transaksi yang ingin dihapus:",
-            reply_markup=_tx_inline_keyboard(txs),
-            parse_mode="Markdown",
-        )
-        return HAPUS_KONFIRMASI
+    if query.data in ("hapus_lagi", "editback:bulan"):
+        return await _show_edit_month_picker(query, context, is_hapus=True)
+
+    if query.data.startswith("editbulan:"):
+        return await edit_pilih_bulan(update, context)
 
     tx_id = query.data.split(":")[1] if ":" in query.data else ""
 
@@ -1023,7 +1086,13 @@ def build_edit_conv() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[CommandHandler("edit", cmd_edit)],
         states={
-            EDIT_PILIH: [CallbackQueryHandler(edit_pilih_tx)],
+            EDIT_BULAN: [
+                CallbackQueryHandler(edit_pilih_bulan, pattern="^editbulan:"),
+                CallbackQueryHandler(cmd_cancel, pattern="^cancel$"),
+            ],
+            EDIT_PILIH: [
+                CallbackQueryHandler(edit_pilih_tx),
+            ],
             EDIT_FIELD: [CallbackQueryHandler(edit_pilih_field)],
             EDIT_NILAI: [
                 CallbackQueryHandler(handle_date_picker_callback, pattern="^datepick:"),
@@ -1039,6 +1108,10 @@ def build_hapus_conv() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[CommandHandler("hapus", cmd_hapus)],
         states={
+            EDIT_BULAN: [
+                CallbackQueryHandler(edit_pilih_bulan, pattern="^editbulan:"),
+                CallbackQueryHandler(cmd_cancel, pattern="^cancel$"),
+            ],
             HAPUS_KONFIRMASI: [CallbackQueryHandler(hapus_konfirmasi)],
         },
         fallbacks=[CommandHandler("batal", cmd_cancel), CallbackQueryHandler(cmd_cancel, pattern="^cancel$")],

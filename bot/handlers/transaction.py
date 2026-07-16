@@ -607,7 +607,8 @@ async def _show_tx_page(query, context, page: int):
         )
     except Exception:
         pass
-    return EDIT_PILIH
+    # Hapus mode kembali ke HAPUS_KONFIRMASI, edit mode ke EDIT_PILIH
+    return HAPUS_KONFIRMASI if mode == "hapus" else EDIT_PILIH
 
 
 async def edit_pilih_tx(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1119,7 +1120,6 @@ def build_transaction_conv() -> ConversationHandler:
         },
         fallbacks=[CommandHandler("batal", cmd_cancel)],
         allow_reentry=True,
-        conversation_timeout=300,
     )
 
 
@@ -1132,7 +1132,7 @@ def build_edit_conv() -> ConversationHandler:
                 CallbackQueryHandler(cmd_cancel, pattern="^cancel$"),
             ],
             EDIT_PILIH: [
-                CallbackQueryHandler(edit_pilih_bulan, pattern="^editpage:"),
+                CallbackQueryHandler(edit_pilih_bulan, pattern="^editpage:|^editback:"),
                 CallbackQueryHandler(edit_pilih_tx),
             ],
             EDIT_FIELD: [CallbackQueryHandler(edit_pilih_field)],
@@ -1142,7 +1142,7 @@ def build_edit_conv() -> ConversationHandler:
             ],
         },
         fallbacks=[CommandHandler("batal", cmd_cancel), CallbackQueryHandler(cmd_cancel, pattern="^cancel$")],
-        conversation_timeout=300,
+        allow_reentry=True,
     )
 
 
@@ -1154,11 +1154,12 @@ def build_hapus_conv() -> ConversationHandler:
                 CallbackQueryHandler(edit_pilih_bulan, pattern="^editbulan:"),
                 CallbackQueryHandler(cmd_cancel, pattern="^cancel$"),
             ],
+            # State untuk daftar transaksi hapus (pakai HAPUS_KONFIRMASI sebagai list state)
             HAPUS_KONFIRMASI: [
-                CallbackQueryHandler(edit_pilih_bulan, pattern="^editpage:"),
+                CallbackQueryHandler(edit_pilih_bulan, pattern="^editpage:|^editback:"),
                 CallbackQueryHandler(hapus_konfirmasi),
             ],
         },
         fallbacks=[CommandHandler("batal", cmd_cancel), CallbackQueryHandler(cmd_cancel, pattern="^cancel$")],
-        conversation_timeout=300,
+        allow_reentry=True,
     )

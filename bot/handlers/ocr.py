@@ -1,6 +1,7 @@
 """
 OCR Handler — tampilkan item detail + total.
 """
+import re
 import traceback
 from datetime import date
 from loguru import logger

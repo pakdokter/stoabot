@@ -1561,7 +1561,7 @@ def _parse_shopee_detail(text: str) -> OcrResult:
             if _is_qty_line(nxt):
                 qty = int(re.search(r'\d+', nxt).group())
                 j += 1
-                break
+                continue  # lanjut cari harga, jangan berhenti (bisa ada baris varian setelah qty)
 
             # Baris harga: "Rp290.000"
             if _is_price_line(nxt):

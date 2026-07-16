@@ -504,7 +504,7 @@ async def _show_edit_month_picker(msg_or_query, context, is_hapus: bool = False)
 
 
 async def edit_pilih_bulan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User pilih bulan, tampilkan semua transaksi bulan itu."""
+    """User pilih bulan, tampilkan transaksi dengan pagination."""
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -514,14 +514,19 @@ async def edit_pilih_bulan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     parts = data.split(":")
+
+    # Navigasi halaman: "editpage:2"
+    if data.startswith("editpage:"):
+        page = int(parts[1])
+        return await _show_tx_page(query, context, page)
+
+    # Pilih bulan baru: "editbulan:YEAR:MONTH:MODE"
     year, month, mode = int(parts[1]), int(parts[2]), parts[3]
     context.user_data["edit_mode"] = mode
     context.user_data["edit_bulan_year"] = year
     context.user_data["edit_bulan_month"] = month
 
     user_id = update.effective_user.id
-
-    # Ambil semua transaksi bulan itu
     from calendar import monthrange
     last_day = monthrange(year, month)[1]
     date_from = date(year, month, 1)
@@ -543,29 +548,65 @@ async def edit_pilih_bulan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not txs:
         bulan_nama = date_from.strftime("%B %Y")
-        await query.edit_message_text(
-            f"📭 Tidak ada transaksi di {bulan_nama}."
-        )
+        await query.edit_message_text(f"📭 Tidak ada transaksi di {bulan_nama}.")
         return ConversationHandler.END
 
-    # Tampilkan semua transaksi bulan itu
+    # Simpan semua tx ID ke context (tidak simpan objek ORM)
+    context.user_data["edit_tx_ids"] = [str(tx.id) for tx in txs]
+    context.user_data["edit_tx_labels"] = [
+        f"{'➕' if tx.type=='masuk' else '➖'} {fmt_date(tx.transaction_date)} "
+        f"{(tx.description or '')[:22]} {fmt_rupiah(tx.amount)}"
+        for tx in txs
+    ]
+    context.user_data["edit_total_txs"] = len(txs)
+
+    return await _show_tx_page(query, context, page=0)
+
+
+async def _show_tx_page(query, context, page: int):
+    """Tampilkan halaman transaksi untuk dipilih (10 per halaman)."""
+    PAGE_SIZE = 10
+    tx_ids = context.user_data.get("edit_tx_ids", [])
+    tx_labels = context.user_data.get("edit_tx_labels", [])
+    mode = context.user_data.get("edit_mode", "edit")
+    year = context.user_data.get("edit_bulan_year")
+    month = context.user_data.get("edit_bulan_month")
+    total = context.user_data.get("edit_total_txs", 0)
+
+    start = page * PAGE_SIZE
+    end = min(start + PAGE_SIZE, total)
+    page_ids = tx_ids[start:end]
+    page_labels = tx_labels[start:end]
+
     rows = []
-    for tx in txs:
-        sym = "➕" if tx.type == "masuk" else "➖"
-        desc = (tx.description or "")[:25]
-        label = f"{sym} {fmt_date(tx.transaction_date)} {desc} {fmt_rupiah(tx.amount)}"
-        rows.append([InlineKeyboardButton(label, callback_data=f"edittx:{tx.id}")])
+    for tx_id, label in zip(page_ids, page_labels):
+        rows.append([InlineKeyboardButton(label, callback_data=f"edittx:{tx_id}")])
+
+    # Navigasi
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀", callback_data=f"editpage:{page-1}"))
+    if end < total:
+        nav.append(InlineKeyboardButton("▶", callback_data=f"editpage:{page+1}"))
+    if nav:
+        rows.append(nav)
 
     rows.append([InlineKeyboardButton("◀ Ganti bulan", callback_data="editback:bulan")])
     rows.append([InlineKeyboardButton("❌ Batal", callback_data="cancel")])
 
     mode_label = "dihapus" if mode == "hapus" else "diedit"
-    bulan_nama = date_from.strftime("%B %Y")
-    await query.edit_message_text(
-        f"{'🗑️' if mode=='hapus' else '✏️'} *{bulan_nama}* — {len(txs)} transaksi\nPilih yang ingin {mode_label}:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(rows),
-    )
+    bulan_nama = date(year, month, 1).strftime("%B %Y")
+    halaman_info = f"hal {page+1}/{-(-total//PAGE_SIZE)}" if total > PAGE_SIZE else f"{total} transaksi"
+
+    try:
+        await query.edit_message_text(
+            f"{'🗑️' if mode=='hapus' else '✏️'} *{bulan_nama}* ({halaman_info})\n"
+            f"Pilih yang ingin {mode_label}:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+    except Exception:
+        pass
     return EDIT_PILIH
 
 
@@ -1091,6 +1132,7 @@ def build_edit_conv() -> ConversationHandler:
                 CallbackQueryHandler(cmd_cancel, pattern="^cancel$"),
             ],
             EDIT_PILIH: [
+                CallbackQueryHandler(edit_pilih_bulan, pattern="^editpage:"),
                 CallbackQueryHandler(edit_pilih_tx),
             ],
             EDIT_FIELD: [CallbackQueryHandler(edit_pilih_field)],
@@ -1112,7 +1154,10 @@ def build_hapus_conv() -> ConversationHandler:
                 CallbackQueryHandler(edit_pilih_bulan, pattern="^editbulan:"),
                 CallbackQueryHandler(cmd_cancel, pattern="^cancel$"),
             ],
-            HAPUS_KONFIRMASI: [CallbackQueryHandler(hapus_konfirmasi)],
+            HAPUS_KONFIRMASI: [
+                CallbackQueryHandler(edit_pilih_bulan, pattern="^editpage:"),
+                CallbackQueryHandler(hapus_konfirmasi),
+            ],
         },
         fallbacks=[CommandHandler("batal", cmd_cancel), CallbackQueryHandler(cmd_cancel, pattern="^cancel$")],
         conversation_timeout=300,

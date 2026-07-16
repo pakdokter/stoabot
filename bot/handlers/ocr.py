@@ -246,6 +246,21 @@ async def handle_shopee_detail(update: Update, context: ContextTypes.DEFAULT_TYP
 
     msg = result.shopee_summary or "Terdeteksi belanja via Shopee"
 
+    # Deteksi kemungkinan item tidak lengkap:
+    # Jika item sum << subtotal_produk, kemungkinan screenshot terpotong di atas
+    subtotal_produk_m = re.search(r'Subtotal\s+Produk\s*[\t:]+Rp([\d.,]+)', result.raw_text or '', re.IGNORECASE)
+    if subtotal_produk_m and result.items:
+        raw = subtotal_produk_m.group(1).replace('.', '').replace(',', '')
+        subtotal_produk = float(raw) if raw.isdigit() else 0
+        item_sum = sum(i.line_total for i in result.items)
+        # Jika subtotal > 150% dari item sum, kemungkinan ada item yang tidak terbaca
+        if subtotal_produk > 0 and item_sum < subtotal_produk * 0.7:
+            msg += (
+                f"\n\n⚠️ *Perhatian:* Subtotal produk di struk adalah *{fmt_rupiah(subtotal_produk)}* "
+                f"tapi hanya *{fmt_rupiah(item_sum)}* yang terbaca.\n"
+                f"_Kemungkinan ada item yang tidak tertangkap — pastikan screenshot mencakup semua item dari atas._"
+            )
+
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Ya, simpan", callback_data="ocr:ya"),
         InlineKeyboardButton("❌ Batal", callback_data="ocr:tidak"),
@@ -253,6 +268,7 @@ async def handle_shopee_detail(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await update.message.reply_text(
         f"{msg}\n\nSimpan sebagai pengeluaran?",
+        parse_mode="Markdown",
         reply_markup=keyboard,
     )
     return OCR_KONFIRMASI

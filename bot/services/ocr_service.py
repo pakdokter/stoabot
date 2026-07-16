@@ -753,6 +753,37 @@ def _parse_items_format_a(lines: list) -> list:
         money_in_line = _extract_money(line)
         has_alpha = bool(re.search(r'[a-zA-Z]', line))
 
+        # Handle baris tab-joined: "NAMA\tHARGA" (hasil join dari 2 baris terpisah)
+        # Contoh: "Dm rec 650 ml\t33,500" atau "SOVIA 2L\t44,500"
+        if '\t' in line and has_alpha:
+            tab_parts = line.split('\t', 1)
+            tab_name = tab_parts[0].strip()
+            tab_rest = tab_parts[1].strip() if len(tab_parts) > 1 else ''
+            tab_money = _extract_money(tab_rest)
+            tab_words = set(re.findall(r'[a-zA-Z]+', tab_name.lower()))
+            if (tab_money and len(tab_name) >= 2 and
+                not (tab_words & header_words) and
+                not re.match(r'^[A-Z]{2,4}\d+[-\d]*$', tab_name) and
+                not re.match(r'^(total|diskon|bayar|kembali|sub\s*total)', tab_name, re.IGNORECASE)):
+                # Cari qty dari baris berikutnya
+                nqty, nunit = 1.0, ''
+                if i + 1 < len(lines):
+                    nl = lines[i + 1]
+                    nq = _extract_qty(nl); nu = _extract_unit(nl)
+                    if nq and nu:
+                        nqty, nunit = nq, nu
+                        i += 1  # consume detail line
+                line_total = tab_money[-1][0]
+                if line_total >= 100:
+                    items.append(ReceiptItem(
+                        name=tab_name.upper()[:60],
+                        qty=nqty, unit=nunit,
+                        unit_price=line_total / nqty,
+                        line_total=line_total,
+                    ))
+                i += 1
+                continue
+
         # Baris nama item: boleh punya angka kecil (kode produk), tapi bukan harga besar
         is_product_code_only = all(v < 10000 for v, _ in money_in_line)
         if has_alpha and _is_item_name_line(line) and (len(money_in_line) == 0 or (len(money_in_line) <= 2 and is_product_code_only)):
@@ -762,7 +793,8 @@ def _parse_items_format_a(lines: list) -> list:
                 i += 1
                 continue
             # Skip pola nomor struk: SI01-2606-0728, SB-9926F03I4915
-            if re.match(r'^[A-Z]{2,4}[0-9-]+', line.strip()):
+            # Hanya skip jika tidak ada spasi (pure kode, bukan nama item dengan angka)
+            if re.match(r'^[A-Z]{2,4}\d+[-\d]*$', line.strip()):
                 i += 1
                 continue
             # Skip baris yang mengandung "X" sebagai operator (header info)
@@ -775,6 +807,64 @@ def _parse_items_format_a(lines: list) -> list:
                 next_money = _extract_money(next_line)
                 next_qty = _extract_qty(next_line)
                 next_unit = _extract_unit(next_line)
+
+                # Pola joined: "NAMA\tHARGA" dalam satu baris (hasil _join_fragmented_lines)
+                # Contoh: "Dm rec 650 ml\t33,500"
+                if '\t' in line:
+                    parts = line.split('\t', 1)
+                    part_name = parts[0].strip()
+                    part_money = _extract_money(parts[1]) if len(parts) > 1 else []
+                    if part_money and len(part_name) >= 2:
+                        # Cari qty dari baris berikutnya (N UNIT HARGA)
+                        nqty = next_qty or 1.0
+                        nunit = next_unit or ''
+                        line_total = part_money[-1][0]
+                        unit_price = next_money[0][0] if next_money and next_qty else line_total / nqty
+                        items.append(ReceiptItem(
+                            name=part_name.upper()[:60],
+                            qty=nqty,
+                            unit=nunit,
+                            unit_price=unit_price,
+                            line_total=line_total,
+                        ))
+                        # Skip baris qty berikutnya jika itu baris detail
+                        if next_qty and next_unit:
+                            i += 2
+                        else:
+                            i += 1
+                        continue
+
+                # Pola 3 baris Primer Raya / Amanah:
+                # NAMA
+                # HARGA_TOTAL        ← baris hanya berisi angka
+                # N  UNIT  HARGA_SATUAN  [HARGA_TOTAL]
+                is_total_only_line = (
+                    len(next_money) >= 1 and
+                    not next_qty and
+                    not next_unit and
+                    not re.search(r'[a-zA-Z]', next_line)
+                )
+                if is_total_only_line and i + 2 < len(lines):
+                    detail_line = lines[i + 2]
+                    detail_money = _extract_money(detail_line)
+                    detail_qty = _extract_qty(detail_line)
+                    detail_unit = _extract_unit(detail_line)
+                    if detail_qty and detail_unit and len(detail_money) >= 1:
+                        name = line.strip()
+                        qty = detail_qty
+                        unit = detail_unit
+                        line_total = next_money[-1][0]  # total dari baris 2
+                        unit_price = detail_money[0][0] if detail_money else line_total / qty
+                        if len(name) >= 2 and line_total >= 100:
+                            items.append(ReceiptItem(
+                                name=name.upper(),
+                                qty=qty,
+                                unit=unit or "",
+                                unit_price=unit_price,
+                                line_total=line_total,
+                            ))
+                        i += 3
+                        continue
 
                 # Baris berikutnya valid: punya harga DAN (qty ATAU unit)
                 # Contoh tanpa qty: "PAKx  45.000=  45.000"
@@ -1509,10 +1599,10 @@ def _parse_shopee_detail(text: str) -> OcrResult:
                 j += 1
 
         if name_raw and len(name_raw) >= 3 and price and price >= 100:
-            # Dedup: jangan tambahkan jika nama terlalu mirip dengan item sebelumnya
+            # Dedup: jangan tambahkan jika nama IDENTIK dengan item sebelumnya
+            # Bandingkan lebih panjang (25 karakter) agar "Pitcher" vs "Milk Jug" tidak dianggap sama
             is_dup = any(
-                name_raw.lower()[:15] in prev['name'].lower() or
-                prev['name'].lower()[:15] in name_raw.lower()
+                name_raw.lower()[:25] == prev['name'].lower()[:25]
                 for prev in items_raw
             )
             if not is_dup:
@@ -2886,7 +2976,6 @@ def _parse_receipt_text(text: str) -> OcrResult:
             result.items = items
             logger.info(f"[OCR] items validated: sum={item_sum} total={result.total}")
         else:
-            # Sum tidak cocok — simpan saja tapi log warning
             result.items = items
             logger.warning(f"[OCR] item sum={item_sum} != total={result.total}")
     else:

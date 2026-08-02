@@ -396,7 +396,10 @@ async def _generate_statement(update_or_query, context):
     date_to = date(year, month, last_day)
 
     if target_user_id == "all":
-        await reply_target.reply_text("⏳ Membuat PDF untuk semua user...")
+        try:
+            await reply_target.reply_text("⏳ Membuat PDF untuk semua user...")
+        except Exception as e:
+            logger.error(f"[STMT] Gagal kirim pesan awal (all): {e}")
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(User).where(User.is_active == True).order_by(User.full_name)
@@ -407,7 +410,10 @@ async def _generate_statement(update_or_query, context):
                                               date_from, date_to, month, year)
         return ConversationHandler.END
 
-    await reply_target.reply_text("⏳ Membuat PDF statement...")
+    try:
+        await reply_target.reply_text("⏳ Membuat PDF statement...")
+    except Exception as e:
+        logger.error(f"[STMT] Gagal kirim pesan awal: {e}")
     async with AsyncSessionLocal() as session:
         _u = await session.get(User, target_user_id)
         user_name = _u.full_name if _u else str(target_user_id)
@@ -418,21 +424,26 @@ async def _generate_statement(update_or_query, context):
 
 async def _generate_single_statement(reply_target, user_id, user_name,
                                       date_from, date_to, month, year):
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            select(Transaction)
-            .where(
-                Transaction.is_deleted == False,
-                Transaction.user_id == user_id,
-                Transaction.transaction_date >= date_from,
-                Transaction.transaction_date <= date_to,
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(Transaction)
+                .where(
+                    Transaction.is_deleted == False,
+                    Transaction.user_id == user_id,
+                    Transaction.transaction_date >= date_from,
+                    Transaction.transaction_date <= date_to,
+                )
+                .order_by(Transaction.transaction_date)
             )
-            .order_by(Transaction.transaction_date)
-        )
-        txs = result.scalars().all()
-        pre_summary = await get_summary(session, user_id=user_id,
-                                        date_to=date_from - timedelta(days=1))
-        saldo_awal = pre_summary["saldo"]
+            txs = result.scalars().all()
+            pre_summary = await get_summary(session, user_id=user_id,
+                                            date_to=date_from - timedelta(days=1))
+            saldo_awal = pre_summary["saldo"]
+    except Exception as e:
+        logger.error(f"[STMT] Query gagal untuk {user_name}: {e}")
+        await reply_target.reply_text(f"❌ Gagal mengambil data untuk {user_name}: {e}")
+        return
 
     if not txs:
         await reply_target.reply_text(

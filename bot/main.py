@@ -145,6 +145,27 @@ async def post_init(application: Application):
     asyncio.create_task(_load_aliases())
 
 
+# ── Global error handler ─────────────────────────────────────────────
+# Tanpa ini, semua exception yang tidak tertangani di handler manapun
+# akan HILANG TANPA JEJAK ke user (cuma masuk log server). Ini penyebab
+# kasus seperti "statement tidak muncul saat digenerate" tanpa pesan
+# error apapun -- exception terjadi di tengah proses (mis. koneksi
+# Telegram sempat putus / query DB timeout), tapi user tidak diberi tahu.
+
+async def error_handler(update, context):
+    logger.error(f"Unhandled exception: {context.error}", exc_info=context.error)
+
+    try:
+        if isinstance(update, Update) and update.effective_chat:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="❌ Terjadi kesalahan saat memproses permintaan. "
+                     "Silakan coba lagi. Jika masih gagal, hubungi admin.",
+            )
+    except Exception as notify_err:
+        logger.error(f"Failed to notify user about error: {notify_err}")
+
+
 # ── App builder ───────────────────────────────────────────────────────
 
 def create_app() -> Application:
@@ -154,6 +175,8 @@ def create_app() -> Application:
         .post_init(post_init)
         .build()
     )
+
+    app.add_error_handler(error_handler)
 
     # ConversationHandlers — harus didaftarkan lebih dulu
     app.add_handler(build_transaction_conv())

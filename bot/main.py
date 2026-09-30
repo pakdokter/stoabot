@@ -27,7 +27,7 @@ from bot.handlers.transaction import (
 )
 from bot.handlers.market import cmd_harga, cmd_sync_harga, cmd_refresh_katalog
 from bot.handlers.audit_admin import build_audit_conv
-from bot.handlers.report import cmd_ringkas, build_laporan_conv, build_statement_conv, build_laporan_teks_conv
+from bot.handlers.report import cmd_ringkas, build_laporan_conv, build_statement_conv, build_laporan_teks_conv, build_kasbuku_conv
 from bot.handlers.ocr import build_ocr_conv
 
 
@@ -118,6 +118,7 @@ async def post_init(application: Application):
         BotCommand("ringkas",      "Ringkasan bulan ini"),
         BotCommand("laporan",      "Laporan per periode"),
         BotCommand("statement",    "E-statement PDF"),
+        BotCommand("kasbuku",      "Export Kas-Buku (Excel)"),
         BotCommand("laporan_teks", "Rekap laporan teks harian staff"),
         BotCommand("harga",        "Cek harga item dari database"),
         BotCommand("sync_harga",   "Sync katalog harga ke Google Sheets"),
@@ -184,6 +185,7 @@ def create_app() -> Application:
     app.add_handler(build_hapus_conv())
     app.add_handler(build_laporan_conv())
     app.add_handler(build_statement_conv())
+    app.add_handler(build_kasbuku_conv())
     app.add_handler(build_ocr_conv())
 
     # Command handlers

@@ -22,6 +22,7 @@ from bot.models import Transaction, User
 from bot.config import settings
 from bot.services.balance import get_summary
 from bot.services.pdf_service import generate_statement_pdf
+from bot.services.kasbuku_service import generate_kasbuku_xlsx
 from bot.utils.formatters import fmt_rupiah, fmt_date, fmt_date_full, parse_date
 from bot.handlers.auth import ensure_registered
 
@@ -31,7 +32,8 @@ from bot.handlers.auth import ensure_registered
     LAPORAN_FROM, LAPORAN_TO,
     STMT_BULAN, STMT_TAHUN,
     LPTEKS_INPUT,
-) = range(6)
+    KASBUKU_BULAN, KASBUKU_TAHUN,
+) = range(8)
 
 
 # ── /ringkas ──────────────────────────────────────────────────────────
@@ -493,6 +495,223 @@ def build_laporan_conv() -> ConversationHandler:
         fallbacks=[CommandHandler("batal", cmd_cancel)],
         allow_reentry=True,
         conversation_timeout=300,
+    )
+
+
+# ── /kasbuku — export Excel format Kas-Buku ──────────────────────────────────
+
+async def cmd_kasbuku(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Export transaksi ke Excel format Kas-Buku (tanggal dd/mm/yyyy, saldo kumulatif)."""
+    if not await ensure_registered(update, context):
+        return ConversationHandler.END
+
+    user_id = update.effective_user.id
+    if user_id in settings.admin_ids:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(User).where(User.is_active == True).order_by(User.full_name)
+            )
+            users = result.scalars().all()
+        rows = [[InlineKeyboardButton("👥 Semua User", callback_data="kb_user:all")]]
+        for u in users:
+            rows.append([InlineKeyboardButton(
+                f"{'👤' if u.id in settings.admin_ids else '🧑'} {u.full_name}",
+                callback_data=f"kb_user:{u.id}"
+            )])
+        await update.message.reply_text(
+            "📗 *Export Kas-Buku (Excel)*\n\nPilih user:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return KASBUKU_BULAN
+
+    context.user_data["kb_target_user_id"] = user_id
+    return await _show_kb_month_picker(update.message, context)
+
+
+async def _show_kb_month_picker(msg_or_reply, context):
+    from dateutil.relativedelta import relativedelta
+    today = date.today()
+    buttons = []
+    row = []
+    for i in range(5, -1, -1):
+        d = today - relativedelta(months=i)
+        row.append(InlineKeyboardButton(d.strftime("%b %Y"), callback_data=f"kb:{d.month}:{d.year}"))
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("✏️ Bulan lain", callback_data="kb:other")])
+
+    target_name = context.user_data.get("kb_target_name", "")
+    header = "📗 *Export Kas-Buku (Excel)*"
+    if target_name and target_name != "all":
+        header += f"\n👤 {target_name}"
+    elif target_name == "all":
+        header += "\n👥 Semua User"
+    header += "\n\nPilih bulan:"
+
+    kwargs = dict(text=header, parse_mode="Markdown",
+                  reply_markup=InlineKeyboardMarkup(buttons))
+    if hasattr(msg_or_reply, "edit_message_text"):
+        await msg_or_reply.edit_message_text(**kwargs)
+    else:
+        await msg_or_reply.reply_text(**kwargs)
+    return KASBUKU_BULAN
+
+
+async def kb_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    target = query.data.split(":")[1]
+    if target == "all":
+        context.user_data["kb_target_user_id"] = "all"
+        context.user_data["kb_target_name"] = "all"
+    else:
+        target_id = int(target)
+        context.user_data["kb_target_user_id"] = target_id
+        async with AsyncSessionLocal() as session:
+            u = await session.get(User, target_id)
+            context.user_data["kb_target_name"] = u.full_name if u else str(target_id)
+    return await _show_kb_month_picker(query, context)
+
+
+async def kb_bulan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    data = query.data
+    if data == "kb:other":
+        try:
+            await query.edit_message_text(
+                "Ketik bulan dan tahun:\n_(contoh: 6/2026 atau 06/2026)_",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        return KASBUKU_TAHUN
+    parts = data.split(":")
+    context.user_data["kb_month"] = int(parts[1])
+    context.user_data["kb_year"] = int(parts[2])
+    return await _generate_kasbuku(query, context)
+
+
+async def kb_bulan_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    m = re.match(r'^(\d{1,2})[/\s](\d{4})$', text)
+    if m:
+        month = int(m.group(1))
+        year = int(m.group(2))
+        if 1 <= month <= 12 and 2000 <= year <= 2100:
+            context.user_data["kb_month"] = month
+            context.user_data["kb_year"] = year
+            return await _generate_kasbuku(update, context)
+    await update.message.reply_text("❌ Format tidak valid. Contoh: 6/2026 atau 06/2026")
+    return KASBUKU_TAHUN
+
+
+async def _generate_kasbuku(update_or_query, context):
+    month = context.user_data["kb_month"]
+    year = context.user_data["kb_year"]
+    target_user_id = context.user_data.get("kb_target_user_id")
+
+    reply_target = update_or_query.message
+    caller_id = (update_or_query.effective_user.id
+                 if hasattr(update_or_query, "effective_user")
+                 else update_or_query.from_user.id)
+    if not target_user_id:
+        target_user_id = caller_id
+
+    date_from = date(year, month, 1)
+    date_to = date(year, month, monthrange(year, month)[1])
+
+    if target_user_id == "all":
+        try:
+            await reply_target.reply_text("⏳ Membuat Kas-Buku Excel untuk semua user...")
+        except Exception:
+            pass
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(User).where(User.is_active == True).order_by(User.full_name)
+            )
+            all_users = result.scalars().all()
+        for u in all_users:
+            await _generate_single_kasbuku(reply_target, u.id, u.full_name,
+                                           date_from, date_to, month, year)
+        return ConversationHandler.END
+
+    try:
+        await reply_target.reply_text("⏳ Membuat Kas-Buku Excel...")
+    except Exception:
+        pass
+    async with AsyncSessionLocal() as session:
+        _u = await session.get(User, target_user_id)
+        user_name = _u.full_name if _u else str(target_user_id)
+    await _generate_single_kasbuku(reply_target, target_user_id, user_name,
+                                   date_from, date_to, month, year)
+    return ConversationHandler.END
+
+
+async def _generate_single_kasbuku(reply_target, user_id, user_name,
+                                   date_from, date_to, month, year):
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(Transaction)
+                .where(
+                    Transaction.is_deleted == False,
+                    Transaction.user_id == user_id,
+                    Transaction.transaction_date >= date_from,
+                    Transaction.transaction_date <= date_to,
+                )
+                .order_by(Transaction.transaction_date, Transaction.created_at)
+            )
+            txs = result.scalars().all()
+            pre_summary = await get_summary(session, user_id=user_id,
+                                            date_to=date_from - timedelta(days=1))
+            saldo_awal = pre_summary["saldo"]
+    except Exception as e:
+        logger.error(f"[KASBUKU] Query gagal untuk {user_name}: {e}")
+        await reply_target.reply_text(f"❌ Gagal mengambil data untuk {user_name}: {e}")
+        return
+
+    if not txs:
+        await reply_target.reply_text(
+            f"📭 *{user_name}*: Tidak ada transaksi di {date_from.strftime('%B %Y')}.",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        xlsx_bytes, filename = generate_kasbuku_xlsx(txs, month, year, saldo_awal=saldo_awal)
+        await reply_target.reply_document(
+            document=io.BytesIO(xlsx_bytes),
+            filename=filename,
+            caption=f"📗 Kas-Buku {date_from.strftime('%B %Y')} — {user_name}",
+        )
+    except Exception as e:
+        logger.error(f"[KASBUKU] generate gagal untuk {user_name}: {e}")
+        await reply_target.reply_text(f"❌ Gagal generate Kas-Buku untuk {user_name}: {e}")
+
+
+def build_kasbuku_conv() -> ConversationHandler:
+    return ConversationHandler(
+        entry_points=[CommandHandler("kasbuku", cmd_kasbuku)],
+        states={
+            KASBUKU_BULAN: [
+                CallbackQueryHandler(kb_user_callback, pattern="^kb_user:"),
+                CallbackQueryHandler(kb_bulan_callback, pattern="^kb:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, kb_bulan_manual),
+            ],
+            KASBUKU_TAHUN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, kb_bulan_manual),
+            ],
+        },
+        fallbacks=[CommandHandler("batal", cmd_cancel)],
+        allow_reentry=True,
     )
 
 

@@ -18,6 +18,10 @@ class User(Base):
     full_name: Mapped[str] = mapped_column(String(128), nullable=False)
     role: Mapped[str] = mapped_column(String(16), default="staff")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Password auth
+    pin: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)  # hashed password
+    pin_name: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)  # nama login (bukan telegram)
+    last_seen: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -71,3 +75,38 @@ class AuditLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     user: Mapped["User"] = relationship(back_populates="audit_logs")
+
+
+class MarketItem(Base):
+    """Katalog nama item pasar — diupdate otomatis setiap transaksi pasar baru."""
+    __tablename__ = "market_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)  # nama item, unik
+    unit: Mapped[Optional[str]] = mapped_column(String(32))                      # kg, pcs, ikat, dll
+    last_price: Mapped[Optional[float]] = mapped_column(Numeric(15, 2))          # harga terakhir dipakai
+    use_count: Mapped[int] = mapped_column(BigInteger, default=1)                # berapa kali dipakai
+    last_used: Mapped[Optional[date]] = mapped_column(Date)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class ItemPrice(Base):
+    """
+    Riwayat harga setiap item dari setiap toko.
+    Diisi otomatis setiap transaksi keluar yang punya item (OCR atau pasar manual).
+    Digunakan untuk analisis harga min/max per bulan per item per toko.
+    """
+    __tablename__ = "item_prices"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    item_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)   # dinormalisasi
+    item_name_raw: Mapped[Optional[str]] = mapped_column(String(128))                  # asli dari OCR/input
+    toko: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+    unit: Mapped[Optional[str]] = mapped_column(String(32))                            # kg, pcs, pack, dll
+    unit_price: Mapped[float] = mapped_column(Numeric(15, 2), nullable=False)          # harga per satuan
+    total_price: Mapped[Optional[float]] = mapped_column(Numeric(15, 2))
+    qty: Mapped[float] = mapped_column(Numeric(10, 3), default=1)
+    transaction_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    transaction_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("transactions.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

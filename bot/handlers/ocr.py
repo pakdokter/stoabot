@@ -1,5 +1,5 @@
 """
-OCR Handler — fix: escape Markdown characters dari OCR output.
+OCR Handler — tampilkan item detail + total.
 """
 import re
 import traceback
@@ -16,20 +16,31 @@ from bot.database import AsyncSessionLocal
 from bot.models import Transaction, Attachment
 from bot.services.ocr_service import process_receipt, OcrResult
 from bot.services.balance import get_running_balance
+from bot.services.sheets import append_transaction as sheets_append
 from bot.services.audit import log_create
 from bot.utils.formatters import fmt_rupiah, fmt_date, parse_amount
 from bot.handlers.auth import ensure_registered
 
-OCR_KONFIRMASI = 50
-OCR_EDIT_NOMINAL = 51
-
-
 def _esc(text: str) -> str:
-    """Escape karakter Markdown agar tidak crash Telegram."""
-    if not text:
-        return text
-    # Escape: * _ ` [ ]
-    return re.sub(r'([*_`\[\]])', r'\\\1', str(text))
+    """Escape karakter Markdown agar tidak break pesan Telegram."""
+    return str(text).replace('_', '\\_').replace('*', '\\*').replace('`', '\\`').replace('[', '\\[')
+
+OCR_KONFIRMASI    = 50
+OCR_EDIT_NOMINAL   = 51
+OCR_EDIT_MENU      = 52
+OCR_EDIT_MERCHANT  = 53
+OCR_EDIT_DATE      = 54
+OCR_EDIT_ITEM_NAME = 59
+OCR_EDIT_ITEM_QTY  = 60
+OCR_QRIS_MERCHANT = 55
+OCR_QRIS_ITEM     = 56
+OCR_QRIS_QTY      = 57
+OCR_QRIS_TOTAL    = 58
+OCR_DISKON_KONFIRM  = 61   # konfirmasi diskon/voucher
+OCR_DONASI_KONFIRM  = 62   # konfirmasi pembulatan/donasi
+
+# Merchant yang sering ada pembulatan donasi kasir
+ROUNDUP_MERCHANTS = {'indomaret', 'alfamart', 'sinar bahagia', 'sb minimarket'}
 
 
 def _log(user_id, state, action, **kwargs):
@@ -41,7 +52,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_registered(update, context):
         return ConversationHandler.END
     user_id = update.effective_user.id
+    # Preserve session_verified dan db_user saat clear
+    _preserved = {
+        k: context.user_data[k]
+        for k in ("session_verified", "db_user")
+        if k in context.user_data
+    }
     context.user_data.clear()
+    context.user_data.update(_preserved)
     _log(user_id, "IDLE", "photo_received")
     await update.message.reply_text("🔍 Memproses struk...")
     try:
@@ -52,6 +70,66 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
              items=len(result.items), confidence=result.confidence)
         context.user_data["ocr_result"] = result
         context.user_data["ocr_file_id"] = photo.file_id
+
+        # Shopee Rincian Pesanan → tampilkan summary langsung
+        if result.is_shopee_detail:
+            return await handle_shopee_detail(update, context, result)
+
+        # QRIS → langsung tanya nama toko (tanpa notif deteksi)
+        if result.is_qris:
+            return await handle_qris_result(update, context, result)
+
+        # Bukti transfer bank → tolak dengan pesan jelas
+        if getattr(result, '_is_bank_transfer', False):
+            await update.message.reply_text(
+                "⚠️ Ini terdeteksi sebagai *bukti transfer bank*, bukan struk belanja.\n\n"
+                "Untuk catat transfer masuk/keluar, gunakan:\n"
+                "  /masuk atau /keluar\n"
+                "lalu isi nominal dan keterangan secara manual.",
+                parse_mode="Markdown",
+            )
+            return ConversationHandler.END
+
+        # Notifikasi deteksi toko untuk struk fisik
+        if result.merchant and result.confidence >= 0.7:
+            await update.message.reply_text(
+                f"🏪 Struk ini terdeteksi sebagai struk *{_esc(result.merchant)}*",
+                parse_mode="Markdown",
+            )
+
+        # ── Deteksi diskon/voucher dan donasi pembulatan ──────────────────
+        # Merchant pembulatan: Indomaret, Alfamart, Sinar Bahagia
+        merchant_lower = (result.merchant or '').lower()
+        is_roundup_merchant = any(m in merchant_lower for m in ROUNDUP_MERCHANTS)
+
+        # Diskon/Voucher: prioritaskan field discount_amount dari parser
+        # (VOUCHER: (8,400) atau ANDA HEMAT sudah diparsing)
+        # Fallback: selisih item sum vs total jika discount_amount tidak ada
+        diskon_amount = 0.0
+        if result.discount_amount and result.discount_amount > 0:
+            diskon_amount = result.discount_amount
+        elif result.items and result.total:
+            item_sum = sum(i.line_total for i in result.items)
+            selisih = round(item_sum - result.total)
+            if 500 <= selisih <= result.total * 0.5:
+                diskon_amount = selisih
+
+        # Donasi/pembulatan: gunakan field `change` dari struk
+        # (KEMBALI: 300 → kembalian kecil = sinyal pembulatan donasi)
+        # Hanya untuk merchant yang biasa bulatkan ke donasi
+        donasi_amount = 0.0
+        if is_roundup_merchant and result.change and 0 < result.change <= 1000:
+            donasi_amount = result.change
+
+        context.user_data["ocr_result"] = result
+        context.user_data["ocr_diskon_amount"] = diskon_amount
+        context.user_data["ocr_donasi_amount"] = donasi_amount
+
+        # Tampilkan question form jika ada diskon DAN/ATAU donasi
+        if diskon_amount > 0 or donasi_amount > 0:
+            return await _show_diskon_donasi_form(update, context, result,
+                                                   diskon_amount, donasi_amount)
+
         return await _show_ocr_result(update, result)
     except Exception as e:
         logger.exception(f"[OCR] uid={user_id} failed: {e}")
@@ -60,7 +138,277 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
 
+
+async def _show_diskon_donasi_form(update, context, result, diskon_amount, donasi_amount):
+    """Tampilkan form konfirmasi diskon/voucher dan donasi sekaligus."""
+    item_sum = sum(i.line_total for i in result.items) if result.items else (result.total or 0)
+    total = result.total or 0
+
+    lines_out = ["\U0001f9fe *Rincian Transaksi*\n"]
+
+    if diskon_amount > 0 and abs(item_sum - total) > 1:
+        lines_out.append(f"Subtotal item  : *{fmt_rupiah(item_sum)}*")
+        lines_out.append(f"Diskon/Voucher : *\u2212 {fmt_rupiah(diskon_amount)}*")
+        lines_out.append(f"Total belanja  : *{fmt_rupiah(total)}*")
+    else:
+        lines_out.append(f"Total belanja  : *{fmt_rupiah(total)}*")
+
+    if donasi_amount > 0:
+        lines_out.append(f"Dibulatkan ke  : *{fmt_rupiah(total + donasi_amount)}*")
+        lines_out.append(f"Kembalian kecil: *{fmt_rupiah(donasi_amount)}*")
+
+    lines_out.append(f"\nToko: *{_esc(result.merchant or '?')}*")
+    lines_out.append("\n*Konfirmasi pencatatan:*")
+
+    rows = []
+    if diskon_amount > 0 and donasi_amount > 0:
+        rows.append([InlineKeyboardButton(
+            f"\u2705 Diskon {fmt_rupiah(diskon_amount)} masuk + Donasi {fmt_rupiah(donasi_amount)}",
+            callback_data="dd:diskon_ya_donasi_ya"
+        )])
+        rows.append([InlineKeyboardButton(
+            f"\u2705 Diskon {fmt_rupiah(diskon_amount)} masuk + Kembalian diambil",
+            callback_data="dd:diskon_ya_donasi_tidak"
+        )])
+        rows.append([InlineKeyboardButton(
+            "\u274c Abaikan keduanya \u2014 pakai total struk saja",
+            callback_data="dd:semua_tidak"
+        )])
+    elif diskon_amount > 0:
+        rows.append([InlineKeyboardButton(
+            f"\u2705 Ya, catat {fmt_rupiah(diskon_amount)} sebagai masuk (diskon)",
+            callback_data="dd:diskon_ya_donasi_tidak"
+        )])
+        rows.append([InlineKeyboardButton(
+            "\u274c Tidak perlu dicatat terpisah",
+            callback_data="dd:semua_tidak"
+        )])
+    elif donasi_amount > 0:
+        rows.append([InlineKeyboardButton(
+            f"\U0001f49d Donasikan {fmt_rupiah(donasi_amount)} (tidak kembali)",
+            callback_data="dd:diskon_tidak_donasi_ya"
+        )])
+        rows.append([InlineKeyboardButton(
+            f"\U0001f4b5 Ambil kembalian {fmt_rupiah(donasi_amount)}",
+            callback_data="dd:semua_tidak"
+        )])
+
+    await update.message.reply_text(
+        "\n".join(lines_out),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return OCR_DISKON_KONFIRM
+
+
+async def handle_diskon_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle konfirmasi diskon/voucher dan donasi pembulatan."""
+    query = update.callback_query
+    await query.answer()
+
+    result: OcrResult = context.user_data.get("ocr_result")
+    diskon_amount = context.user_data.get("ocr_diskon_amount", 0)
+    donasi_amount = context.user_data.get("ocr_donasi_amount", 0)
+
+    if not result:
+        await query.edit_message_text("⏰ Sesi habis.")
+        return ConversationHandler.END
+
+    data = query.data  # "dd:diskon_ya_donasi_ya" dll
+    parts = data.split(":")[1] if ":" in data else ""
+
+    catat_diskon = "diskon_ya" in parts
+    catat_donasi = "donasi_ya" in parts
+
+    context.user_data["ocr_catat_diskon"] = catat_diskon
+    context.user_data["ocr_catat_donasi"] = catat_donasi
+    context.user_data["ocr_diskon_amount"] = diskon_amount if catat_diskon else 0
+    context.user_data["ocr_donasi_amount"] = donasi_amount if catat_donasi else 0
+
+    lines_out = ["✅ *Rencana pencatatan:*\n"]
+    lines_out.append(f"➖ Belanja *{_esc(result.merchant or '?')}* — *{fmt_rupiah(result.total)}*")
+    if catat_diskon and diskon_amount > 0:
+        lines_out.append(f"➕ Diskon/Voucher — *{fmt_rupiah(diskon_amount)}*")
+    if catat_donasi and donasi_amount > 0:
+        lines_out.append(f"➖ Donasi — *{fmt_rupiah(donasi_amount)}*")
+
+    await query.edit_message_text("\n".join(lines_out), parse_mode="Markdown")
+
+    class _FakeUpdate:
+        def __init__(self, q): self.message = q.message; self.effective_user = q.from_user
+    return await _show_ocr_result(_FakeUpdate(query), result)
+
+
+
+
+async def handle_shopee_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, result: OcrResult):
+    """Tampilkan ringkasan Rincian Pesanan Shopee dan minta konfirmasi."""
+    from bot.utils.formatters import fmt_rupiah
+
+    msg = result.shopee_summary or "Terdeteksi belanja via Shopee"
+
+    # Deteksi kemungkinan item tidak lengkap:
+    # Jika item sum << subtotal_produk, kemungkinan screenshot terpotong di atas
+    subtotal_produk_m = re.search(r'Subtotal\s+Produk\s*[\t:]+Rp([\d.,]+)', result.raw_text or '', re.IGNORECASE)
+    if subtotal_produk_m and result.items:
+        raw = subtotal_produk_m.group(1).replace('.', '').replace(',', '')
+        subtotal_produk = float(raw) if raw.isdigit() else 0
+        item_sum = sum(i.line_total for i in result.items)
+        # Jika subtotal > 150% dari item sum, kemungkinan ada item yang tidak terbaca
+        if subtotal_produk > 0 and item_sum < subtotal_produk * 0.7:
+            msg += (
+                f"\n\n⚠️ *Perhatian:* Subtotal produk di struk adalah *{fmt_rupiah(subtotal_produk)}* "
+                f"tapi hanya *{fmt_rupiah(item_sum)}* yang terbaca.\n"
+                f"_Kemungkinan ada item yang tidak tertangkap — pastikan screenshot mencakup semua item dari atas._"
+            )
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Ya, simpan", callback_data="ocr:ya"),
+        InlineKeyboardButton("❌ Batal", callback_data="ocr:tidak"),
+    ]])
+
+    await update.message.reply_text(
+        f"{msg}\n\nSimpan sebagai pengeluaran?",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+    return OCR_KONFIRMASI
+
+
+async def handle_qris_result(update: Update, context: ContextTypes.DEFAULT_TYPE, result: OcrResult):
+    """Tampilkan deteksi QRIS dan minta input manual merchant/item."""
+    from bot.utils.formatters import fmt_rupiah, fmt_date
+
+    merchant = result.merchant or "tidak terdeteksi"
+    total_str = fmt_rupiah(result.total) if result.total else "belum terdeteksi"
+    date_str = fmt_date(result.tx_date) if result.tx_date else "hari ini"
+
+    await update.message.reply_text(
+        f"💳 Terdeteksi: Bukti Pembayaran QRIS\n\n"
+        f"Merchant: {merchant}\n"
+        f"Total: {total_str}\n"
+        f"Tanggal: {date_str}\n\n"
+        f"Lengkapi data belanja:\n"
+        f"Ketik nama toko/merchant yang benar:",
+    )
+    return OCR_QRIS_MERCHANT
+
+
+async def qris_input_merchant(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Input nama merchant QRIS."""
+    text = update.message.text.strip()
+    if len(text) < 2:
+        await update.message.reply_text("❌ Nama terlalu pendek.")
+        return OCR_QRIS_MERCHANT
+    context.user_data["qris_merchant"] = text
+    await update.message.reply_text(
+        f"🏪 Merchant: {text}\n\n"
+        f"Ketik nama item yang dibeli:\n(tulis singkat, contoh: Kopi Ethiopia, Matcha Latte)",
+    )
+    return OCR_QRIS_ITEM
+
+
+async def qris_input_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Input nama item QRIS."""
+    text = update.message.text.strip()
+    if len(text) < 2:
+        await update.message.reply_text("❌ Nama item tidak valid.")
+        return OCR_QRIS_ITEM
+    context.user_data["qris_item"] = text
+    await update.message.reply_text(
+        f"📦 Item: {text}\n\nJumlah (qty)?\n(ketik angka, misal: 1)",
+    )
+    return OCR_QRIS_QTY
+
+
+async def qris_input_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Input qty QRIS."""
+    text = update.message.text.strip()
+    try:
+        qty = int(text)
+        if qty < 1:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Qty tidak valid. Ketik angka, misal: 1")
+        return OCR_QRIS_QTY
+    context.user_data["qris_qty"] = qty
+
+    result: OcrResult = context.user_data.get("ocr_result")
+    total_hint = f"\n(Terdeteksi: {fmt_rupiah(result.total)})" if result and result.total else ""
+    await update.message.reply_text(
+        f"🔢 Qty: {qty}\n\nHarga total?{total_hint}\n(atau ketik 'sama' untuk pakai yang terdeteksi)",
+    )
+    return OCR_QRIS_TOTAL
+
+
+async def qris_input_total(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Input total QRIS dan simpan."""
+    from bot.utils.formatters import parse_amount, fmt_rupiah, fmt_date
+    text = update.message.text.strip().lower()
+    user_id = update.effective_user.id
+
+    result: OcrResult = context.user_data.get("ocr_result")
+
+    if text in ("sama", "s", "y", "ya"):
+        amount = result.total if result else 0
+    else:
+        amount = parse_amount(text)
+
+    if not amount or amount <= 0:
+        await update.message.reply_text("❌ Nominal tidak valid.")
+        return OCR_QRIS_TOTAL
+
+    merchant = context.user_data.get("qris_merchant", "QRIS")
+    item = context.user_data.get("qris_item", "Belanja")
+    qty = context.user_data.get("qris_qty", 1)
+    tx_date = result.tx_date if result else date.today()
+    qty_str = f" x{qty}" if qty > 1 else ""
+    description = f"{merchant} — {item}{qty_str}"
+
+    try:
+        async with AsyncSessionLocal() as session:
+            tx = Transaction(
+                user_id=user_id, type="keluar", amount=amount,
+                description=description, transaction_date=tx_date,
+            )
+            session.add(tx)
+            await session.flush()
+            await log_create(session, user_id, tx)
+            await session.commit()
+
+        async with AsyncSessionLocal() as session2:
+            saldo = await get_running_balance(session2, user_id=user_id)
+
+        db_user = context.user_data.get("db_user")
+        user_name = db_user.full_name if db_user else str(user_id)
+        await sheets_append(
+            user_id=user_id, user_name=user_name,
+            tx_type="keluar", amount=amount,
+            description=description, tx_date=tx_date,
+            source="qris",
+        )
+
+        await update.message.reply_text(
+            f"✅ Transaksi QRIS berhasil disimpan\n\n"
+            f"Merchant: {merchant}\n"
+            f"Item: {item}{qty_str}\n"
+            f"Total: {fmt_rupiah(amount)}\n"
+            f"Tanggal: {fmt_date(tx_date)}\n\n"
+            f"💰 Saldo saat ini: {fmt_rupiah(saldo)}",
+        )
+    except Exception as e:
+        logger.error(f"[QRIS] save failed: {e}")
+        await update.message.reply_text(f"❌ Gagal menyimpan.\n`{e}`", parse_mode="Markdown")
+
+    _p = {k: context.user_data[k] for k in ("session_verified","db_user") if k in context.user_data}
+    context.user_data.clear()
+    context.user_data.update(_p)
+    return ConversationHandler.END
+
+
+
 async def _show_ocr_result(update: Update, result: OcrResult):
+    """Tampilkan hasil OCR dengan rincian item."""
     lines = ["📄 *Hasil Baca Struk*\n"]
     lines.append(f"Toko: *{_esc(result.merchant or 'tidak terdeteksi')}*")
 
@@ -69,15 +417,18 @@ async def _show_ocr_result(update: Update, result: OcrResult):
     else:
         lines.append("Tanggal: _tidak terdeteksi_ (pakai hari ini)")
 
+    # ── Rincian item ──
     if result.items:
         lines.append("\n🛒 *Item:*")
         for item in result.items:
             qty_str = f"({int(item.qty)}x) " if item.qty > 1 else ""
-            lines.append(f"  • {_esc(item.name)} {qty_str}— *{fmt_rupiah(item.line_total)}*")
+            safe_name = _esc(item.name)
+            lines.append(f"  • {safe_name} {qty_str}— *{fmt_rupiah(item.line_total)}*")
         lines.append(f"\nTotal Item: *{len(result.items)}*")
     else:
         lines.append("\n_Item tidak terdeteksi_")
 
+    # ── Total belanja ──
     if result.total:
         lines.append(f"Total Belanja: *{fmt_rupiah(result.total)}*")
         if result.cash_paid:
@@ -91,7 +442,7 @@ async def _show_ocr_result(update: Update, result: OcrResult):
 
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Ya, simpan", callback_data="ocr:ya"),
-        InlineKeyboardButton("✏️ Edit nominal", callback_data="ocr:edit"),
+        InlineKeyboardButton("✏️ Edit", callback_data="ocr:edit"),
         InlineKeyboardButton("❌ Batal", callback_data="ocr:tidak"),
     ]])
 
@@ -114,6 +465,10 @@ async def ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     result: OcrResult = context.user_data.get("ocr_result")
+    _log(user_id, "WAITING_CONFIRMATION", "callback",
+         data=query.data, result_exists=result is not None,
+         total=result.total if result else None)
+
     if result is None:
         try: await query.edit_message_text("⏰ Sesi habis. Kirim ulang foto struk.")
         except Exception: pass
@@ -132,25 +487,267 @@ async def ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await _do_save(query, context, user_id, from_query=True)
 
     if action == "edit":
+        _log(user_id, "WAITING_CONFIRMATION", "edit_menu_opened")
+        result: OcrResult = context.user_data.get("ocr_result")
+        has_items = result and len(result.items) > 0
+
+        # Tampilkan rincian item di atas menu edit
+        lines = ["✏️ *Edit Struk*\n"]
+        if result:
+            lines.append(f"Toko: *{_esc(result.merchant or '?')}*")
+            lines.append(f"Tanggal: *{fmt_date(result.tx_date)}*" if result.tx_date else "Tanggal: _hari ini_")
+            if result.items:
+                lines.append("\n🛒 *Item:*")
+                for i, item in enumerate(result.items, 1):
+                    qty_str = f" x{int(item.qty)}" if item.qty > 1 else ""
+                    lines.append(f"  {i}. {_esc(item.name)}{qty_str} — *{fmt_rupiah(item.line_total)}*")
+            if result.total:
+                lines.append(f"\nTotal: *{fmt_rupiah(result.total)}*")
+
+        lines.append("\n_Pilih bagian yang ingin diedit:_")
+
+        rows = [[
+            InlineKeyboardButton("🏪 Nama Toko", callback_data="ocredit:merchant"),
+            InlineKeyboardButton("📅 Tanggal", callback_data="ocredit:date"),
+        ],[
+            InlineKeyboardButton("💰 Nominal", callback_data="ocredit:nominal"),
+        ]]
+        if has_items:
+            rows.append([
+                InlineKeyboardButton("📝 Nama Item", callback_data="ocredit:item_name"),
+                InlineKeyboardButton("🔢 Qty Item", callback_data="ocredit:item_qty"),
+            ])
+        rows.append([InlineKeyboardButton("❌ Batal", callback_data="ocr:tidak")])
+
+        keyboard = InlineKeyboardMarkup(rows)
+        try:
+            await query.edit_message_text(
+                "\n".join(lines), parse_mode="Markdown", reply_markup=keyboard
+            )
+        except Exception as e:
+            logger.error(f"[OCR] edit menu failed: {e}")
+        return OCR_EDIT_MENU
+
+    return OCR_KONFIRMASI
+
+
+async def ocr_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler tombol pilihan edit."""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    try:
+        await query.answer()
+    except Exception as e:
+        logger.warning(f"[OCR] query.answer failed: {e}")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    result: OcrResult = context.user_data.get("ocr_result")
+    if result is None:
+        try: await query.edit_message_text("⏰ Sesi habis. Kirim ulang foto struk.")
+        except Exception: pass
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    field = query.data.split(":")[1]
+
+    if field == "nominal":
         current = fmt_rupiah(result.total) if result.total else "belum terdeteksi"
         try:
             await query.edit_message_text(
-                f"✏️ Nominal saat ini: *{current}*\n\n"
-                f"Masukkan nominal yang benar:\n_(Contoh: 45000, 45rb, 1.5jt)_",
+                f"💰 Nominal saat ini: *{current}*\n\nMasukkan nominal baru:\n_(Contoh: 45000, 45rb)_",
                 parse_mode="Markdown",
             )
-        except Exception as e:
-            logger.error(f"[OCR] edit_message_text failed: {e}")
-            try: await query.message.reply_text("✏️ Masukkan nominal baru:")
-            except Exception: pass
+        except Exception: pass
+        context.user_data["ocr_edit_field"] = "nominal"
         return OCR_EDIT_NOMINAL
 
+    if field == "merchant":
+        current = result.merchant or "tidak terdeteksi"
+        try:
+            await query.edit_message_text(
+                f"🏪 Nama toko saat ini: *{_esc(current)}*\n\nMasukkan nama toko yang benar:",
+                parse_mode="Markdown",
+            )
+        except Exception: pass
+        context.user_data["ocr_edit_field"] = "merchant"
+        return OCR_EDIT_MERCHANT
+
+    if field == "date":
+        current = fmt_date(result.tx_date) if result.tx_date else "hari ini"
+        try:
+            await query.edit_message_text(
+                f"📅 Tanggal saat ini: *{current}*\n\nMasukkan tanggal baru:\n_(Format: DD/MM/YYYY, contoh: 07/06/2026)_",
+                parse_mode="Markdown",
+            )
+        except Exception: pass
+        context.user_data["ocr_edit_field"] = "date"
+        return OCR_EDIT_DATE
+
+    if field == "item_name":
+        # Tampilkan daftar item dan minta pilih mana yang diedit
+        if not result.items:
+            await query.edit_message_text("❌ Tidak ada item yang bisa diedit.")
+            return OCR_KONFIRMASI
+        if len(result.items) == 1:
+            item = result.items[0]
+            context.user_data["ocr_edit_item_idx"] = 0
+            try:
+                await query.edit_message_text(
+                    f"📝 Nama item saat ini: *{_esc(item.name)}*\n\nMasukkan nama item baru:",
+                    parse_mode="Markdown",
+                )
+            except Exception: pass
+            context.user_data["ocr_edit_field"] = "item_name"
+            return OCR_EDIT_ITEM_NAME
+        # Lebih dari 1 item: tampilkan pilihan
+        rows = [[InlineKeyboardButton(f"{i+1}. {item.name[:30]}", callback_data=f"ocredit:item_name_idx_{i}")]
+                for i, item in enumerate(result.items)]
+        await query.edit_message_text(
+            "📝 Pilih item yang namanya ingin diedit:",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return OCR_EDIT_ITEM_NAME
+
+    if field.startswith("item_name_idx_"):
+        idx = int(field.split("_")[-1])
+        context.user_data["ocr_edit_item_idx"] = idx
+        item = result.items[idx]
+        try:
+            await query.edit_message_text(
+                f"📝 Nama item saat ini: *{_esc(item.name)}*\n\nMasukkan nama item baru:",
+                parse_mode="Markdown",
+            )
+        except Exception: pass
+        context.user_data["ocr_edit_field"] = "item_name"
+        return OCR_EDIT_ITEM_NAME
+
+    if field == "item_qty":
+        if not result.items:
+            await query.edit_message_text("❌ Tidak ada item.")
+            return OCR_KONFIRMASI
+        if len(result.items) == 1:
+            item = result.items[0]
+            context.user_data["ocr_edit_item_idx"] = 0
+            try:
+                await query.edit_message_text(
+                    f"🔢 Qty item *{_esc(item.name)}* saat ini: *{item.qty}*\n\nMasukkan qty baru:",
+                    parse_mode="Markdown",
+                )
+            except Exception: pass
+            context.user_data["ocr_edit_field"] = "item_qty"
+            return OCR_EDIT_ITEM_QTY
+        rows = [[InlineKeyboardButton(f"{i+1}. {item.name[:25]} (qty={item.qty})", callback_data=f"ocredit:item_qty_idx_{i}")]
+                for i, item in enumerate(result.items)]
+        await query.edit_message_text(
+            "🔢 Pilih item yang qty-nya ingin diedit:",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return OCR_EDIT_ITEM_QTY
+
+    if field.startswith("item_qty_idx_"):
+        idx = int(field.split("_")[-1])
+        context.user_data["ocr_edit_item_idx"] = idx
+        item = result.items[idx]
+        try:
+            await query.edit_message_text(
+                f"🔢 Qty item *{_esc(item.name)}* saat ini: *{item.qty}*\n\nMasukkan qty baru:",
+                parse_mode="Markdown",
+            )
+        except Exception: pass
+        context.user_data["ocr_edit_field"] = "item_qty"
+        return OCR_EDIT_ITEM_QTY
+
+    return OCR_KONFIRMASI
+
+
+async def ocr_edit_merchant(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler input nama toko baru."""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    result: OcrResult = context.user_data.get("ocr_result")
+    if result is None:
+        await update.message.reply_text("⏰ Sesi habis.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    if len(text) < 2:
+        await update.message.reply_text("❌ Nama terlalu pendek.")
+        return OCR_EDIT_MERCHANT
+
+    result.merchant = text
+    context.user_data["ocr_result"] = result
+    context.user_data["ocr_edit_field"] = None
+    return await _show_ocr_confirm(update, result, from_edit=True)
+
+
+async def ocr_edit_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler input tanggal baru."""
+    from bot.utils.formatters import parse_date
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    result: OcrResult = context.user_data.get("ocr_result")
+    if result is None:
+        await update.message.reply_text("⏰ Sesi habis.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    new_date = parse_date(text)
+    if not new_date:
+        await update.message.reply_text(
+            "❌ Format tanggal tidak valid.\nContoh: `07/06/2026`",
+            parse_mode="Markdown"
+        )
+        return OCR_EDIT_DATE
+
+    result.tx_date = new_date
+    context.user_data["ocr_result"] = result
+    context.user_data["ocr_edit_field"] = None
+    return await _show_ocr_confirm(update, result, from_edit=True)
+
+
+async def _show_ocr_confirm(update: Update, result: OcrResult, from_edit: bool = False):
+    """Tampilkan preview terbaru setelah edit."""
+    lines = ["✅ *Data diperbarui*\n" if from_edit else "📄 *Hasil Baca Struk*\n"]
+    lines.append(f"Toko: *{_esc(result.merchant or 'tidak terdeteksi')}*")
+    lines.append(f"Tanggal: *{fmt_date(result.tx_date)}*" if result.tx_date else "Tanggal: _pakai hari ini_")
+
+    if result.items:
+        lines.append("\n🛒 *Item:*")
+        for item in result.items:
+            qty_str = f"({int(item.qty)}x) " if item.qty > 1 else ""
+            lines.append(f"  • {_esc(item.name)} {qty_str}— *{fmt_rupiah(item.line_total)}*")
+        lines.append(f"\nTotal Item: *{len(result.items)}*")
+    else:
+        lines.append("\n_Item tidak terdeteksi_")
+
+    if result.total:
+        lines.append(f"Total Belanja: *{fmt_rupiah(result.total)}*")
+        if result.cash_paid: lines.append(f"_Tunai: {fmt_rupiah(result.cash_paid)}_")
+        if result.change: lines.append(f"_Kembali: {fmt_rupiah(result.change)}_")
+    else:
+        lines.append("\nTotal: _belum terdeteksi_")
+
+    lines.append("\nSimpan sebagai pengeluaran?")
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Ya, simpan", callback_data="ocr:ya"),
+        InlineKeyboardButton("✏️ Edit lagi", callback_data="ocr:edit"),
+        InlineKeyboardButton("❌ Batal", callback_data="ocr:tidak"),
+    ]])
+
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode="Markdown", reply_markup=keyboard
+    )
     return OCR_KONFIRMASI
 
 
 async def ocr_edit_nominal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
+    logger.info(f"=== EDIT_AMOUNT RECEIVED ===\nInput: {text!r}\nSession: {list(context.user_data.keys())}\n===")
 
     result: OcrResult = context.user_data.get("ocr_result")
     if result is None:
@@ -171,14 +768,15 @@ async def ocr_edit_nominal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     merchant = result.merchant or "Belanja (struk)"
     tx_date = result.tx_date or date.today()
 
-    lines = ["✅ Nominal diperbarui.\n"]
+    # Tampilkan preview dengan item jika ada
+    lines = [f"✅ Nominal diperbarui.\n"]
     if result.items:
         lines.append("🛒 *Item:*")
         for item in result.items:
             qty_str = f"({int(item.qty)}x) " if item.qty > 1 else ""
             lines.append(f"  • {_esc(item.name)} {qty_str}— *{fmt_rupiah(item.line_total)}*")
         lines.append(f"\nTotal Item: *{len(result.items)}*")
-    lines.append(f"Toko: *{_esc(merchant)}*")
+    lines.append(f"Toko: *{merchant}*")
     lines.append(f"Tanggal: *{fmt_date(tx_date)}*")
     lines.append(f"Total Belanja: *{fmt_rupiah(amount)}*\n\nSimpan?")
 
@@ -191,45 +789,112 @@ async def ocr_edit_nominal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return OCR_KONFIRMASI
 
 
+async def ocr_edit_item_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler input nama item baru."""
+    text = update.message.text.strip()
+    result: OcrResult = context.user_data.get("ocr_result")
+    idx = context.user_data.get("ocr_edit_item_idx", 0)
+
+    if not result or idx >= len(result.items):
+        await update.message.reply_text("⏰ Sesi habis.")
+        return ConversationHandler.END
+
+    if len(text) < 2:
+        await update.message.reply_text("❌ Nama terlalu pendek.")
+        return OCR_EDIT_ITEM_NAME
+
+    result.items[idx].name = text.upper()
+    context.user_data["ocr_result"] = result
+    return await _show_ocr_confirm(update, result, from_edit=True)
+
+
+async def ocr_edit_item_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler input qty item baru."""
+    text = update.message.text.strip().replace(",", ".")
+    result: OcrResult = context.user_data.get("ocr_result")
+    idx = context.user_data.get("ocr_edit_item_idx", 0)
+
+    if not result or idx >= len(result.items):
+        await update.message.reply_text("⏰ Sesi habis.")
+        return ConversationHandler.END
+
+    try:
+        qty = float(text)
+        if qty <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Qty tidak valid. Masukkan angka (contoh: 2 atau 1.5)")
+        return OCR_EDIT_ITEM_QTY
+
+    item = result.items[idx]
+    item.qty = qty
+    item.line_total = item.unit_price * qty
+    # Update total struk
+    result.total = sum(i.line_total for i in result.items)
+    context.user_data["ocr_result"] = result
+    return await _show_ocr_confirm(update, result, from_edit=True)
+
+
 async def _do_save(update_or_query, context, user_id, from_query):
     result: OcrResult = context.user_data.get("ocr_result")
     file_id = context.user_data.get("ocr_file_id", "")
 
     if not result:
+        logger.error(f"[OCR] uid={user_id} _do_save: no ocr_result")
         return ConversationHandler.END
 
     amount = result.total or 0
     merchant = result.merchant or "Belanja (struk)"
     tx_date = result.tx_date or date.today()
 
-    if result.items:
-        item_desc = ", ".join(
-            f"{item.name}{'x'+str(int(item.qty)) if item.qty > 1 else ''}"
-            for item in result.items
-        )
-        description = f"{merchant} ({item_desc})"
-    else:
-        description = merchant
-    description = description[:200]
+    logger.info(f"=== BEFORE SAVE ===\nuid={user_id} amount={amount} merchant={merchant!r}\n===")
 
     if amount <= 0:
         msg = "❌ Nominal belum diset. Gunakan ✏️ Edit nominal."
         try:
             if from_query: await update_or_query.edit_message_text(msg)
             else: await update_or_query.message.reply_text(msg)
-        except Exception: pass
+        except Exception as e:
+            logger.error(f"[OCR] reply failed: {e}")
         context.user_data.clear()
         return ConversationHandler.END
 
+    # Jika ada item terdeteksi → simpan per item sebagai transaksi terpisah
+    # Jika tidak ada item → simpan satu transaksi dengan total
+    transactions_to_save = []
+    if result.items:
+        for item in result.items:
+            qty_str = f" x{int(item.qty)}" if item.qty > 1 else ""
+            desc = f"{merchant} — {item.name}{qty_str}"[:200]
+            transactions_to_save.append(("keluar", item.line_total, desc))
+    else:
+        transactions_to_save.append(("keluar", amount, merchant))
+
+    # Tambah transaksi diskon sebagai masuk
+    catat_diskon = context.user_data.get("ocr_catat_diskon", False)
+    diskon_amount = context.user_data.get("ocr_diskon_amount", 0)
+    if catat_diskon and diskon_amount > 0:
+        transactions_to_save.append(("masuk", diskon_amount, f"Diskon/Voucher {merchant}"))
+
+    # Tambah transaksi donasi sebagai keluar
+    catat_donasi = context.user_data.get("ocr_catat_donasi", False)
+    donasi_amount = context.user_data.get("ocr_donasi_amount", 0)
+    if catat_donasi and donasi_amount > 0:
+        transactions_to_save.append(("keluar", donasi_amount, f"Donasi {merchant}"))
+
     try:
+        # ── 1. Simpan ke DB (critical path) ──
         async with AsyncSessionLocal() as session:
-            tx = Transaction(
-                user_id=user_id, type="keluar", amount=amount,
-                description=description, transaction_date=tx_date,
-            )
-            session.add(tx)
-            await session.flush()
-            tx_id = tx.id
+            saved_ids = []
+            for tx_type, tx_amount, tx_desc in transactions_to_save:
+                tx = Transaction(
+                    user_id=user_id, type=tx_type, amount=tx_amount,
+                    description=tx_desc, transaction_date=tx_date,
+                )
+                session.add(tx)
+                await session.flush()
+                saved_ids.append(tx.id)
+            tx_id = saved_ids[0]
             if file_id:
                 session.add(Attachment(
                     transaction_id=tx_id, telegram_file_id=file_id,
@@ -238,13 +903,16 @@ async def _do_save(update_or_query, context, user_id, from_query):
                 ))
             await log_create(session, user_id, tx)
             await session.commit()
+            logger.info(f"[OCR] saved {len(saved_ids)} tx(s), first_id={tx_id}")
 
+        # ── 2. Ambil saldo (cepat, satu query) ──
         async with AsyncSessionLocal() as session2:
-            saldo = await get_running_balance(session2)
+            saldo = await get_running_balance(session2, user_id=user_id)
 
+        # ── 3. Balas user SEGERA ──
         lines = ["✅ *Transaksi berhasil disimpan*\n"]
         if result.items:
-            lines.append("🛒 *Rincian:*")
+            lines.append("🛒 *Rincian (per item):*")
             for item in result.items:
                 qty_str = f"({int(item.qty)}x) " if item.qty > 1 else ""
                 lines.append(f"  • {_esc(item.name)} {qty_str}— {fmt_rupiah(item.line_total)}")
@@ -255,14 +923,56 @@ async def _do_save(update_or_query, context, user_id, from_query):
         lines.append(f"\n💰 Saldo saat ini:\n*{fmt_rupiah(saldo)}*")
 
         msg = "\n".join(lines)
+
         try:
             if from_query: await update_or_query.edit_message_text(msg, parse_mode="Markdown")
             else: await update_or_query.message.reply_text(msg, parse_mode="Markdown")
         except Exception as e:
             logger.error(f"[OCR] reply after save failed: {e}")
+            msg_plain = msg.replace('*', '').replace('_', '').replace('`', '')
             try:
-                if from_query: await update_or_query.message.reply_text(msg, parse_mode="Markdown")
+                if from_query: await update_or_query.message.reply_text(msg_plain)
+                else: await update_or_query.message.reply_text(msg_plain)
             except Exception: pass
+
+        # ── 4. Background tasks (non-blocking, tidak tunda reply user) ──
+        db_user = context.user_data.get("db_user")
+        user_name = db_user.full_name if db_user else str(user_id)
+
+        async def _background_tasks():
+            # Sheets sync
+            try:
+                for tx_type, tx_amount, tx_desc in transactions_to_save:
+                    await sheets_append(
+                        user_id=user_id, user_name=user_name,
+                        tx_type=tx_type, amount=tx_amount,
+                        description=tx_desc, tx_date=tx_date,
+                        source="struk",
+                    )
+            except Exception as e:
+                logger.warning(f"[OCR] sheets background failed: {e}")
+            # Item price recording
+            try:
+                from bot.services.item_price_service import record_item_price
+                async with AsyncSessionLocal() as bg_session:
+                    for item in result.items:
+                        await record_item_price(
+                            session=bg_session,
+                            item_name_raw=item.name,
+                            toko=merchant,
+                            total_price=float(item.line_total),
+                            qty=float(item.qty),
+                            unit=str(item.unit or ''),
+                            transaction_date=tx_date,
+                            transaction_id=tx_id,
+                        )
+                    if result.items:
+                        await bg_session.commit()
+            except Exception as e:
+                logger.warning(f"[PRICE] background record failed: {e}")
+
+        import asyncio
+        asyncio.create_task(_background_tasks())
 
     except Exception as e:
         tb = traceback.format_exc()
@@ -285,10 +995,45 @@ def build_ocr_conv() -> ConversationHandler:
                 CallbackQueryHandler(ocr_callback, pattern="^ocr:"),
                 MessageHandler(filters.PHOTO, handle_photo),
             ],
+            OCR_EDIT_MENU: [
+                CallbackQueryHandler(ocr_edit_menu, pattern="^ocredit:"),
+                CallbackQueryHandler(ocr_callback, pattern="^ocr:"),
+            ],
             OCR_EDIT_NOMINAL: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ocr_edit_nominal),
                 MessageHandler(filters.PHOTO, handle_photo),
                 CallbackQueryHandler(ocr_callback, pattern="^ocr:"),
+            ],
+            OCR_EDIT_MERCHANT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ocr_edit_merchant),
+                MessageHandler(filters.PHOTO, handle_photo),
+            ],
+            OCR_EDIT_DATE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ocr_edit_date),
+                MessageHandler(filters.PHOTO, handle_photo),
+            ],
+            OCR_EDIT_ITEM_NAME: [
+                CallbackQueryHandler(ocr_edit_menu, pattern="^ocredit:item_name_idx_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ocr_edit_item_name),
+            ],
+            OCR_EDIT_ITEM_QTY: [
+                CallbackQueryHandler(ocr_edit_menu, pattern="^ocredit:item_qty_idx_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ocr_edit_item_qty),
+            ],
+            OCR_DISKON_KONFIRM: [
+                CallbackQueryHandler(handle_diskon_callback, pattern="^dd:"),
+            ],
+            OCR_QRIS_MERCHANT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, qris_input_merchant),
+            ],
+            OCR_QRIS_ITEM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, qris_input_item),
+            ],
+            OCR_QRIS_QTY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, qris_input_qty),
+            ],
+            OCR_QRIS_TOTAL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, qris_input_total),
             ],
         },
         fallbacks=[],

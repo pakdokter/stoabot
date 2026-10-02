@@ -16,6 +16,7 @@ from bot.handlers.transaction import (
 )
 from bot.handlers.report import cmd_ringkas, build_laporan_conv, build_statement_conv
 from bot.handlers.ocr import build_ocr_conv
+from bot.handlers import rekap
 
 logger.remove()
 logger.add(
@@ -41,7 +42,8 @@ async def cmd_start(update, context):
         "/statement — e-statement PDF\n"
         "/edit — edit transaksi\n"
         "/hapus — hapus transaksi\n"
-        "/cari — cari transaksi\n\n"
+        "/cari — cari transaksi\n"
+        "/rekap_mulai — rekap forward catatan/nota (buku kas 9 kolom)\n\n"
         "📸 Kirim *foto struk* untuk input otomatis!\n\n"
         "/batal — batalkan perintah aktif",
         parse_mode="Markdown",
@@ -68,6 +70,10 @@ async def post_init(application: Application):
         BotCommand("edit", "Edit transaksi"),
         BotCommand("hapus", "Hapus transaksi"),
         BotCommand("cari", "Cari transaksi"),
+        BotCommand("rekap_mulai", "Mulai rekap catatan forward"),
+        BotCommand("rekap_selesai", "Simpan & buat rekap 9 kolom"),
+        BotCommand("rekap_status", "Status sesi rekap"),
+        BotCommand("rekap_batal", "Batalkan sesi rekap"),
         BotCommand("batal", "Batalkan perintah aktif"),
     ])
     logger.info(f"Starting bot — {settings.business_name}")
@@ -79,6 +85,7 @@ def create_app() -> Application:
         .post_init(post_init)
         .build()
     )
+    rekap.register(app)
     app.add_handler(build_belanja_conv())
     app.add_handler(build_transaction_conv())
     app.add_handler(build_edit_conv())

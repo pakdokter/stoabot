@@ -29,6 +29,7 @@ from bot.handlers.market import cmd_harga, cmd_sync_harga, cmd_refresh_katalog
 from bot.handlers.audit_admin import build_audit_conv
 from bot.handlers.report import cmd_ringkas, build_laporan_conv, build_statement_conv, build_laporan_teks_conv
 from bot.handlers.ocr import build_ocr_conv
+from bot.handlers import rekap
 
 
 # ── Logging ──────────────────────────────────────────────────────────
@@ -83,7 +84,8 @@ async def cmd_start(update, context):
         "*✏️ Manajemen:*\n"
         "/edit — edit transaksi\n"
         "/hapus — hapus transaksi\n"
-        "/cari — cari transaksi\n\n"
+        "/cari — cari transaksi\n"
+        "/rekap\\_mulai — rekap forward catatan/nota (buku kas 9 kolom)\n\n"
         "📸 Kirim *foto struk* untuk input otomatis!\n\n"
         "/batal — batalkan perintah aktif",
         parse_mode="Markdown",
@@ -126,6 +128,10 @@ async def post_init(application: Application):
         BotCommand("edit",         "Edit transaksi"),
         BotCommand("hapus",        "Hapus transaksi"),
         BotCommand("cari",         "Cari transaksi"),
+        BotCommand("rekap_mulai",  "Mulai rekap catatan forward"),
+        BotCommand("rekap_selesai", "Simpan & buat rekap 9 kolom"),
+        BotCommand("rekap_status", "Status sesi rekap"),
+        BotCommand("rekap_batal",  "Batalkan sesi rekap"),
         BotCommand("batal",        "Batalkan perintah aktif"),
     ])
     logger.info(f"Starting bot — {settings.business_name}")
@@ -177,6 +183,9 @@ def create_app() -> Application:
     )
 
     app.add_error_handler(error_handler)
+
+    # Rekap forward (group -1: menangkap forward sebelum handler OCR)
+    rekap.register(app)
 
     # ConversationHandlers — harus didaftarkan lebih dulu
     app.add_handler(build_transaction_conv())

@@ -119,14 +119,6 @@ def main():
                            VALUES (%(kode)s,%(match)s,%(isi)s,%(toko)s,%(sumber)s) ON CONFLICT DO NOTHING""", a)
         for a, (nm, kt) in recon_map.items():
             cur.execute("INSERT INTO recon.kamus_bahan VALUES (%s,%s,%s) ON CONFLICT (alias) DO NOTHING", (a, nm, kt or "Belanja Bahan"))
-        cur.execute("SELECT count(*) FROM shared.harga_belanja")
-        if cur.fetchone()[0]:
-            print("harga_belanja sudah terisi -> dilewati (cegah duplikat)")
-            harga = []
-        for h in harga:
-            cur.execute("""INSERT INTO shared.harga_belanja
-                (bahan_kode,item_name,item_name_raw,toko,unit,qty,unit_price,total_price,transaction_date,transaction_id)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""", h)
     print("\nAPPLY selesai.")
 
 

@@ -36,9 +36,12 @@ fi
 SRC_URL="$STOA_URL"     bash copy_app_schema.sh stoa
 SRC_URL="$MENUPLAN_URL" bash copy_app_schema.sh menuplan
 $PY migrate_bahan.py --apply
-# shared_rules milik bot-recon (ada di DB stoabot lama) -> shared.shared_rules
-pg_dump "$STOA_URL" --data-only --table=public.shared_rules --no-owner \
-  | sed 's/public\.shared_rules/shared.shared_rules/g' | psql "$NEW_URL" -v ON_ERROR_STOP=1 -q || echo "(shared_rules dilewati)"
+# shared_rules milik bot-recon (di DB stoabot lama, schema public): salin hanya jika belum ada
+if [ "$(psql "$NEW_URL" -Atc 'select count(*) from shared.shared_rules')" = "0" ]; then
+  psql "$STOA_URL" -Atc "select count(*) from public.shared_rules" >/dev/null 2>&1 && \
+  pg_dump "$STOA_URL" --data-only --table=public.shared_rules --no-owner \
+    | perl -pe 's/public\.shared_rules/shared.shared_rules/g' | psql "$NEW_URL" -v ON_ERROR_STOP=1 -q
+fi
 psql "$NEW_URL" -v ON_ERROR_STOP=1 -q -f 002_views.sql
 
 echo "=== verifikasi jumlah baris (lama -> baru) ==="

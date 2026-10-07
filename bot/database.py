@@ -12,6 +12,8 @@ def _make_engine():
         ssl_ctx.check_hostname = False
         ssl_ctx.verify_mode = ssl.CERT_NONE
         kwargs["connect_args"] = {"ssl": ssl_ctx}
+    if settings.db_search_path:
+        kwargs.setdefault("connect_args", {})["server_settings"] = {"search_path": settings.db_search_path}
     return create_async_engine(url, **kwargs)
 
 engine = _make_engine()

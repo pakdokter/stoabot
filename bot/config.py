@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     database_url_sync: str = ""
 
     # Redis
+    # Postgres induk bersama: schema/search_path, mis. "stoa,shared". Kosong = schema public (lama)
+    db_search_path: str = ""
+
     redis_url: str = "redis://localhost:6379/0"
 
     # OCR

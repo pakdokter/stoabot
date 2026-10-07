@@ -33,6 +33,7 @@ def fetch(url, sql):
 def main():
     bahan, alias, kategori = {}, {}, {}   # kode -> dict ; (match,toko) -> dict
     konflik, tak_terpetakan = [], []
+    recon_map = {}   # alias(lower) -> (nama_baku, kategori): pemetaan recon utuh
 
     # 1) menuplan = sumber utama struktur bahan (kode, satuan, jenis, kategori, isi)
     if os.environ.get("MENUPLAN_URL"):
@@ -74,6 +75,7 @@ def main():
             else:
                 bahan[kode]["kategori_recon"] = kat_recon
             for a in [nama] + list(e.get("alias", [])):
+                recon_map[norm(a)] = (nama, kat_recon)
                 tambah_alias(a, kode, "recon")
 
     # 3) stoabot: nama item belanja -> bahan lewat alias; sisanya dilaporkan
@@ -91,6 +93,7 @@ def main():
 
     # ── laporan ──
     from collections import Counter
+    print(f"recon.kamus_bahan: {len(recon_map)} alias")
     print(f"bahan: {len(bahan)} | alias: {len(alias)} | kategori: {len(kategori)} | baris harga: {len(harga)}")
     print(f"konflik alias (satu nama -> dua bahan, DILEWATI): {len(konflik)}")
     for m, k1, k2, s in konflik[:50]:
@@ -114,6 +117,12 @@ def main():
         for a in alias.values():
             cur.execute("""INSERT INTO shared.bahan_alias (bahan_kode,match,isi,toko,sumber)
                            VALUES (%(kode)s,%(match)s,%(isi)s,%(toko)s,%(sumber)s) ON CONFLICT DO NOTHING""", a)
+        for a, (nm, kt) in recon_map.items():
+            cur.execute("INSERT INTO recon.kamus_bahan VALUES (%s,%s,%s) ON CONFLICT (alias) DO NOTHING", (a, nm, kt or "Belanja Bahan"))
+        cur.execute("SELECT count(*) FROM shared.harga_belanja")
+        if cur.fetchone()[0]:
+            print("harga_belanja sudah terisi -> dilewati (cegah duplikat)")
+            harga = []
         for h in harga:
             cur.execute("""INSERT INTO shared.harga_belanja
                 (bahan_kode,item_name,item_name_raw,toko,unit,qty,unit_price,total_price,transaction_date,transaction_id)

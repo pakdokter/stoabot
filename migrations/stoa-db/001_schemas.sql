@@ -82,3 +82,11 @@ LEFT JOIN LATERAL (
     LIMIT 1
 ) hb ON TRUE
 LEFT JOIN menuplan.harga_manual hm ON hm.bahan_kode = b.kode;
+
+-- ── recon: kamus bahan bot-recon (pemetaan alias -> nama baku Kas-Buku) ──
+-- Menyimpan pemetaan asli recon utuh, termasuk yang kalah konflik di shared.bahan_alias.
+CREATE TABLE IF NOT EXISTS recon.kamus_bahan (
+    alias     TEXT PRIMARY KEY,           -- huruf kecil, dicocokkan utuh
+    nama_baku TEXT NOT NULL,
+    kategori  TEXT NOT NULL               -- 'Belanja Bahan' | 'Kemasan'
+);

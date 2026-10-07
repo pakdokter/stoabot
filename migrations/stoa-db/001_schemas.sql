@@ -51,3 +51,11 @@ CREATE TABLE IF NOT EXISTS menuplan.harga_manual (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+
+-- ── recon: kamus bahan bot-recon (pemetaan alias -> nama baku Kas-Buku) ──
+-- Menyimpan pemetaan asli recon utuh, termasuk yang kalah konflik di shared.bahan_alias.
+CREATE TABLE IF NOT EXISTS recon.kamus_bahan (
+    alias     TEXT PRIMARY KEY,           -- huruf kecil, dicocokkan utuh
+    nama_baku TEXT NOT NULL,
+    kategori  TEXT NOT NULL               -- 'Belanja Bahan' | 'Kemasan'
+);

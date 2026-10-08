@@ -56,8 +56,31 @@ class KasRow:
     catatan: str = ""
 
 
+def _token(teks: str) -> set[str]:
+    """Token pembeda seperti resolve_account_sheet reconbot: dipisah spasi/kurung, minimal 3 huruf."""
+    return {t for t in re.split(r"[\s()]+", (teks or "").lower()) if len(t) >= 3}
+
+
+def bentrok_dengan_bank(nama: str) -> bool:
+    """True kalau nama pemilik berbagi kata dengan sheet rekening bank (BANK_SUMBER), mis. 'Royyan Paice'
+    vs sheet 'BCA - Royyan'. Dengan nama polos, reconbot (token terpanjang, seri -> sheet pertama)
+    akan memetakan kedua petunjuk ke SATU sheet yang sama, bergantung urutan sheet."""
+    bank = set().union(*(_token(b) for b in settings.bank_labels)) if settings.bank_labels else set()
+    return bool(_token(nama) & bank)
+
+
+def _nama_bentrok(nama: str) -> str:
+    """Satu token tanpa spasi (reconbot tidak memecah di tanda hubung), jadi unik dan terpanjang."""
+    depan = (nama or "").strip().split()[0] if (nama or "").strip() else "Kantong"
+    return f"{depan}-Kantong"
+
+
 def label_kantong(nama: str) -> str:
-    return f"Kantong {nama.strip()}" if nama and nama.strip() else "Kantong"
+    """Label Subjek/Objek untuk kantong ini. Biasanya 'Kantong <Nama>'; kalau bentrok dengan sheet bank
+    memakai nama satu-token (lihat bentrok_dengan_bank)."""
+    if not nama or not nama.strip():
+        return "Kantong"
+    return _nama_bentrok(nama) if bentrok_dengan_bank(nama) else f"Kantong {nama.strip()}"
 
 
 def map_kategori(kategori: Optional[str]) -> str:
@@ -87,12 +110,12 @@ def pihak(uraian: str, tx_type: str, owner_label: str) -> tuple[str, str]:
     if tx_type == "keluar":
         m = _RE_KE_KANTONG.search(teks)
         if m:
-            return owner_label, f"Kantong {m.group(1).title()}"
+            return owner_label, label_kantong(m.group(1).title())
         toko = teks.split(" — ")[0].strip() if " — " in teks else ""
         return owner_label, toko or "-"
     m = _RE_DARI_KANTONG.search(teks)
     if m:
-        return f"Kantong {m.group(1).title()}", owner_label
+        return label_kantong(m.group(1).title()), owner_label
     return _sumber_dikenal().get(teks.lower(), "-"), owner_label
 
 
@@ -138,7 +161,7 @@ def kategori_transfer(subjek: str, objek: str, owner_label: str) -> str:
     if lawan == owner_label or not lawan or lawan == "-":
         return ""
     l = lawan.lower()
-    internal = l in ("kasir", "bank biru") or l.startswith("kantong ") or l in {b.lower() for b in settings.bank_labels}
+    internal = l in ("kasir", "bank biru") or l.startswith("kantong ") or l.endswith("-kantong") or l in {b.lower() for b in settings.bank_labels}
     return "Transaksi Internal" if internal else ""
 
 
@@ -208,6 +231,8 @@ def _nama_sheet(owner: str) -> str:
     """Nama sheet = nama pemilik SAJA, tanpa awalan "Kantong". reconbot mencocokkan Subjek/Objek ke
     nama sheet lewat token terpanjang (resolve_account_sheet); awalan "Kantong" yang dipakai semua
     sheet membuat semua kantong terpetakan ke sheet pertama."""
+    if owner and bentrok_dengan_bank(owner):
+        return _nama_bentrok(owner)
     s = re.sub(r"[\[\]:*?/\\]", " ", (owner or "").strip() or "Kantong")
     return re.sub(r"\s+", " ", s).strip()[:31]
 

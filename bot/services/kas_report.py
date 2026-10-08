@@ -88,6 +88,41 @@ def pihak(uraian: str, tx_type: str, owner_label: str) -> tuple[str, str]:
     return SUMBER_DIKENAL.get(teks.lower(), "-"), owner_label
 
 
+_RE_QTY = re.compile(
+    r"(?:\bx\s*\d+(?:[.,]\d+)?\b|\(\s*\d+\s*item\s*\)|\b\d+(?:[.,]\d+)?\s*(?:kg|gr?|gram|ml|l|ltr|pcs|pack|bks|biji|ikat)\b|\b\d+[/¼½¾⅛]+\d*\b|[¼½¾⅛])",
+    re.I)
+
+
+def normalisasi_item(teks: str) -> str:
+    """Nama item dari keterangan 'Toko — Item', tanpa jumlah/ukuran, huruf kecil."""
+    item = (teks or "").split(" — ", 1)[-1]
+    item = _RE_QTY.sub(" ", item.lower())
+    return " ".join(re.sub(r"[^a-z0-9 ]+", " ", item).split())
+
+
+class KamusKategori:
+    """Kategori belanja dari katalog bahan bersama (shared.bahan + bahan_alias).
+    HANYA bahan yang sudah punya kategori reconbot (Belanja Bahan / Kemasan) yang dipakai;
+    bahan menuplan tanpa kategori recon (mis. obat, alat tulis) sengaja tidak dipetakan."""
+
+    def __init__(self, alias_ke_kategori: dict[str, str]):
+        self.exact = {normalisasi_item(a): k for a, k in alias_ke_kategori.items() if normalisasi_item(a)}
+        # alias >= 5 huruf yang muncul utuh (batas kata) di nama item; alias terpanjang menang
+        self.frasa = sorted((a for a in self.exact if len(a) >= 5), key=len, reverse=True)
+
+    def cari(self, uraian: str) -> str:
+        item = normalisasi_item(uraian)
+        if not item:
+            return ""
+        if item in self.exact:
+            return self.exact[item]
+        padded = f" {item} "
+        for a in self.frasa:
+            if f" {a} " in padded:
+                return self.exact[a]
+        return ""
+
+
 def kategori_transfer(subjek: str, objek: str, owner_label: str) -> str:
     """"Transaksi Internal" kalau lawan transaksinya Kasir atau kantong lain (bukan toko/pihak luar),
     supaya reconbot memperlakukannya sebagai kandidat pencocokan transfer antar sheet."""
@@ -97,7 +132,33 @@ def kategori_transfer(subjek: str, objek: str, owner_label: str) -> str:
     return "Transaksi Internal" if lawan.lower() == "kasir" or lawan.lower().startswith("kantong ") else ""
 
 
-def dari_transaksi(tx, owner_label: str) -> KasRow:
+async def muat_kamus_kategori(session) -> "KamusKategori":
+    """Muat sumber kategori dari Postgres induk. Urutan prioritas (yang belakangan menang):
+    shared.bahan (hanya yang sudah berkategori recon) < recon.kamus_bahan < recon.kamus_overhead,
+    sehingga pemetaan asli reconbot selalu menang. Sumber yang gagal dimuat (mis. DB lama tanpa schema
+    shared/recon) dilewati; laporan tetap jalan, kategorinya saja yang tidak terisi otomatis."""
+    from sqlalchemy import text
+    sumber = (
+        "SELECT a.match, b.kategori_recon FROM shared.bahan_alias a JOIN shared.bahan b ON b.kode = a.bahan_kode "
+        "WHERE b.kategori_recon IN ('Belanja Bahan', 'Kemasan')",
+        "SELECT alias, kategori FROM recon.kamus_bahan",
+        "SELECT alias, kategori FROM recon.kamus_overhead",
+    )
+    peta: dict[str, str] = {}
+    for sql in sumber:
+        try:
+            for alias, kategori in (await session.execute(text(sql))).all():
+                if alias and kategori:
+                    peta[alias] = kategori
+        except Exception:
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+    return KamusKategori(peta)
+
+
+def dari_transaksi(tx, owner_label: str, kamus: "KamusKategori | None" = None) -> KasRow:
     """Transaction stoabot -> KasRow. keluar = Debit negatif, masuk = Kredit positif."""
     amt = Decimal(str(tx.amount))
     keluar = tx.type == "keluar"
@@ -105,7 +166,9 @@ def dari_transaksi(tx, owner_label: str) -> KasRow:
     return KasRow(
         tanggal=tx.transaction_date, uraian=tx.description,
         debit=-amt if keluar else None, kredit=None if keluar else amt,
-        kategori=map_kategori(tx.category) or kategori_transfer(subjek, objek, owner_label),
+        kategori=(map_kategori(tx.category)
+                  or (kamus.cari(tx.description) if kamus and keluar else "")
+                  or kategori_transfer(subjek, objek, owner_label)),
         subjek=subjek, objek=objek,
         ket="Struk terlampir" if getattr(tx, "attachments", None) else "",
     )

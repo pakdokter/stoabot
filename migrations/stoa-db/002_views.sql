@@ -16,21 +16,13 @@ LEFT JOIN LATERAL (
 ) a ON TRUE
 WHERE ip.transaction_id IS NULL OR (t.id IS NOT NULL AND t.is_deleted = FALSE);
 
--- Harga efektif: manual kalau ada, kalau tidak harga belanja terakhir.
-CREATE OR REPLACE VIEW menuplan.v_harga_efektif AS
-SELECT b.kode,
-       b.nama,
-       hb.harga_belanja,
-       hb.tgl_belanja,
-       hm.harga                               AS harga_manual,
-       COALESCE(hm.harga, hb.harga_belanja)   AS harga_efektif,
-       CASE WHEN hm.harga IS NOT NULL THEN 'manual' ELSE 'belanja' END AS sumber
-FROM shared.bahan b
-LEFT JOIN LATERAL (
-    SELECT h.unit_price AS harga_belanja, h.transaction_date AS tgl_belanja
-    FROM shared.harga_belanja h
-    WHERE h.bahan_kode = b.kode AND h.unit_price IS NOT NULL
-    ORDER BY h.transaction_date DESC, h.created_at DESC
-    LIMIT 1
-) hb ON TRUE
-LEFT JOIN menuplan.harga_manual hm ON hm.bahan_kode = b.kode;
+-- Baris harga belanja aktif untuk Menuplan (KATALOG_BERSAMA): tanpa resolusi alias, kolom sama dengan sp_harga.
+CREATE OR REPLACE VIEW shared.harga_belanja_aktif AS
+SELECT ip.id, ip.item_name, ip.item_name_raw, ip.toko, ip.unit,
+       COALESCE(ip.qty, 1) AS qty,
+       COALESCE(ip.total_price, ip.unit_price * COALESCE(ip.qty, 1)) AS total_price,
+       ip.transaction_date, ip.transaction_id, ip.created_at
+FROM stoa.item_prices ip
+LEFT JOIN stoa.transactions t ON t.id = ip.transaction_id
+WHERE (ip.transaction_id IS NULL OR (t.id IS NOT NULL AND t.is_deleted = FALSE))
+  AND COALESCE(ip.total_price, ip.unit_price) > 0;

@@ -69,7 +69,15 @@ _RE_KE_KANTONG = re.compile(r"\b(?:ke|masuk)\s+kantong\s+([A-Za-z]+)", re.I)
 
 
 # Keterangan uang masuk yang jelas menyebut sumbernya (tanpa pola "dari kantong X").
-SUMBER_DIKENAL = {"kasir": "Kasir", "owner": "Owner", "bos": "Owner", "stoa space": "Stoa Space"}
+SUMBER_DIKENAL = {"kasir": "Kasir", "bank biru": "Bank Biru", "owner": "Owner", "bos": "Owner", "stoa space": "Stoa Space"}
+
+
+def _sumber_dikenal() -> dict[str, str]:
+    """Sumber tetap + rekening bank dari settings (nama sheet reconbot, apa adanya)."""
+    peta = dict(SUMBER_DIKENAL)
+    for b in settings.bank_labels:
+        peta[b.lower()] = b
+    return peta
 
 
 def pihak(uraian: str, tx_type: str, owner_label: str) -> tuple[str, str]:
@@ -85,7 +93,7 @@ def pihak(uraian: str, tx_type: str, owner_label: str) -> tuple[str, str]:
     m = _RE_DARI_KANTONG.search(teks)
     if m:
         return f"Kantong {m.group(1).title()}", owner_label
-    return SUMBER_DIKENAL.get(teks.lower(), "-"), owner_label
+    return _sumber_dikenal().get(teks.lower(), "-"), owner_label
 
 
 _RE_QTY = re.compile(
@@ -129,7 +137,9 @@ def kategori_transfer(subjek: str, objek: str, owner_label: str) -> str:
     lawan = objek if subjek == owner_label else subjek
     if lawan == owner_label or not lawan or lawan == "-":
         return ""
-    return "Transaksi Internal" if lawan.lower() == "kasir" or lawan.lower().startswith("kantong ") else ""
+    l = lawan.lower()
+    internal = l in ("kasir", "bank biru") or l.startswith("kantong ") or l in {b.lower() for b in settings.bank_labels}
+    return "Transaksi Internal" if internal else ""
 
 
 async def muat_kamus_kategori(session) -> "KamusKategori":

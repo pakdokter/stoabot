@@ -8,7 +8,6 @@ from datetime import date
 from decimal import Decimal
 from typing import Optional
 
-from bot.services.kas_report import KasRow
 from bot.utils.formatters import parse_amount
 
 COLUMNS = [
@@ -117,24 +116,3 @@ def parse_note_text(text: str, default_date: date, sumber: str = "") -> tuple[li
             kategori=guess_category(uraian, tx_type), sumber=sumber,
         ))
     return entries, skipped
-
-
-def to_kas_rows(entries: list[RekapEntry], owner_label: str) -> list[KasRow]:
-    """RekapEntry -> baris buku kas seragam (format reconbot), urut tanggal. No. Bukti & sumber
-    forward masuk ke Keterangan Tambahan."""
-    from bot.services.kas_report import map_kategori, pihak
-
-    counters: dict[str, int] = {}
-    rows: list[KasRow] = []
-    for e in sorted(entries, key=lambda e: e.tanggal):  # stabil: urutan forward dipertahankan
-        prefix = f"{'KM' if e.type == 'masuk' else 'KK'}-{e.tanggal:%y%m%d}"
-        counters[prefix] = counters.get(prefix, 0) + 1
-        amt = Decimal(str(e.amount))
-        subjek, objek = pihak(e.uraian, e.type, owner_label)
-        ket = f"No. Bukti {prefix}-{counters[prefix]:02d}" + (f"; Sumber: {e.sumber}" if e.sumber else "")
-        rows.append(KasRow(
-            tanggal=e.tanggal, uraian=e.uraian,
-            debit=-amt if e.type == "keluar" else None, kredit=amt if e.type == "masuk" else None,
-            kategori=map_kategori(e.kategori), subjek=subjek, objek=objek, ket=ket,
-        ))
-    return rows

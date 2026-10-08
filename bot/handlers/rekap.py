@@ -27,10 +27,8 @@ from bot.models import Attachment, Transaction
 from bot.services.audit import log_create
 from bot.services.balance import get_running_balance
 from bot.services.ocr_service import process_receipt
-from bot.services.rekap_service import (
-    RekapEntry, build_rows, generate_pdf, generate_xlsx, parse_note_text, totals,
-    guess_category,
-)
+from bot.services import kas_report
+from bot.services.rekap_service import RekapEntry, guess_category, parse_note_text, to_kas_rows
 from bot.utils.formatters import fmt_date, fmt_rupiah
 
 KEY = "rekap_session"
@@ -175,15 +173,20 @@ async def cmd_rekap_selesai(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Gagal menyimpan. Sesi tetap aktif, coba /rekap_selesai lagi.")
         return
 
-    rows = build_rows(entries, saldo_awal)
-    d, k, s = totals(rows)
+    db_user = context.user_data.get("db_user")
+    owner = (getattr(db_user, "full_name", None) or update.effective_user.full_name or "Rekap").strip()
+    rows = to_kas_rows(entries, kas_report.label_kantong(owner))
+    td, tk, akhir = kas_report.ringkas(rows, saldo_awal)
+    tgl = [r.tanggal for r in rows]
+    periode = kas_report.periode_label(min(tgl), max(tgl))
     stamp = date.today().strftime("%Y%m%d")
     await update.message.reply_document(
-        io.BytesIO(generate_xlsx(rows)), filename=f"rekap_kas_{stamp}.xlsx",
-        caption=(f"📒 Rekap {len(entries)} transaksi\nDebit: {fmt_rupiah(d)}\n"
-                 f"Kredit: {fmt_rupiah(k)}\nSaldo akhir: {fmt_rupiah(s)}"),
+        io.BytesIO(kas_report.generate_xlsx([(owner, rows, saldo_awal)])), filename=f"rekap_kas_{stamp}.xlsx",
+        caption=(f"📒 Rekap {len(entries)} transaksi — Kantong {owner}\nDebit (keluar): {fmt_rupiah(abs(td))}\n"
+                 f"Kredit (masuk): {fmt_rupiah(tk)}\nSaldo akhir: {fmt_rupiah(akhir)}"),
     )
-    await update.message.reply_document(io.BytesIO(generate_pdf(rows)), filename=f"rekap_kas_{stamp}.pdf")
+    await update.message.reply_document(
+        io.BytesIO(kas_report.generate_pdf(owner, rows, saldo_awal, periode)), filename=f"rekap_kas_{stamp}.pdf")
     if sess["skipped"]:
         await update.message.reply_text(
             f"⚠️ {len(sess['skipped'])} baris dilewati. Catat manual lewat /masuk atau /keluar."

@@ -21,7 +21,8 @@ from bot.database import AsyncSessionLocal
 from bot.models import Transaction, User
 from bot.config import settings
 from bot.services.balance import get_summary
-from bot.services.pdf_service import generate_statement_pdf
+from bot.services import kas_report
+from sqlalchemy.orm import selectinload
 from bot.utils.formatters import fmt_rupiah, fmt_date, fmt_date_full, parse_date
 from bot.handlers.auth import ensure_registered
 
@@ -257,7 +258,7 @@ async def cmd_statement(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )])
 
         await update.message.reply_text(
-            "📄 *E-Statement PDF*\n\nPilih user:",
+            "📄 *Laporan Kas Kantong (Excel + PDF)*\n\nPilih pemilik kantong:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(rows),
         )
@@ -397,7 +398,7 @@ async def _generate_statement(update_or_query, context):
 
     if target_user_id == "all":
         try:
-            await reply_target.reply_text("⏳ Membuat PDF untuk semua user...")
+            await reply_target.reply_text("⏳ Membuat laporan (Excel + PDF) untuk semua kantong...")
         except Exception as e:
             logger.error(f"[STMT] Gagal kirim pesan awal (all): {e}")
         async with AsyncSessionLocal() as session:
@@ -405,13 +406,29 @@ async def _generate_statement(update_or_query, context):
                 select(User).where(User.is_active == True).order_by(User.full_name)
             )
             all_users = result.scalars().all()
+        items, kosong = [], []
         for u in all_users:
-            await _generate_single_statement(reply_target, u.id, u.full_name,
-                                              date_from, date_to, month, year)
+            try:
+                item = await _ambil_kantong(u.id, u.full_name, date_from, date_to)
+            except Exception as e:
+                logger.error(f"[STMT] Query gagal untuk {u.full_name}: {e}")
+                await reply_target.reply_text(f"❌ Gagal mengambil data untuk {u.full_name}: {e}")
+                continue
+            (items if item else kosong).append(item or u.full_name)
+        if items:
+            try:
+                await _kirim_laporan(reply_target, items, date_from, date_to, month, year)
+            except Exception as e:
+                logger.error(f"[STMT] Laporan semua kantong gagal: {e}")
+                await reply_target.reply_text(f"❌ Gagal membuat laporan: {e}")
+        else:
+            await reply_target.reply_text(f"\U0001f4ed Tidak ada transaksi di {date_from.strftime('%B %Y')}.")
+        if kosong:
+            await reply_target.reply_text("Tanpa transaksi bulan ini: " + ", ".join(kosong))
         return ConversationHandler.END
 
     try:
-        await reply_target.reply_text("⏳ Membuat PDF statement...")
+        await reply_target.reply_text("⏳ Membuat laporan kas (Excel + PDF)...")
     except Exception as e:
         logger.error(f"[STMT] Gagal kirim pesan awal: {e}")
     async with AsyncSessionLocal() as session:
@@ -422,48 +439,67 @@ async def _generate_statement(update_or_query, context):
     return ConversationHandler.END
 
 
+async def _ambil_kantong(user_id, user_name, date_from, date_to):
+    """Ambil transaksi & saldo awal satu kantong. Return (nama, rows, saldo_awal) atau None kalau kosong."""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(Transaction)
+            .options(selectinload(Transaction.attachments))
+            .where(
+                Transaction.is_deleted == False,
+                Transaction.user_id == user_id,
+                Transaction.transaction_date >= date_from,
+                Transaction.transaction_date <= date_to,
+            )
+            .order_by(Transaction.transaction_date, Transaction.created_at)
+        )
+        txs = result.scalars().all()
+        pre = await get_summary(session, user_id=user_id, date_to=date_from - timedelta(days=1))
+    if not txs:
+        return None
+    label = kas_report.label_kantong(user_name)
+    return user_name, [kas_report.dari_transaksi(t, label) for t in txs], pre["saldo"]
+
+
+async def _kirim_laporan(reply_target, items, date_from, date_to, month, year):
+    """Kirim 1 Excel (1 sheet per kantong) + 1 PDF per kantong, format seragam reconbot."""
+    periode = kas_report.periode_label(date_from, date_to)
+    stamp = f"{year}_{month:02d}"
+    xlsx = kas_report.generate_xlsx([(n, rows, saldo) for n, rows, saldo in items])
+    nama_xlsx = (f"kas_{items[0][0].replace(' ', '_')}_{stamp}.xlsx" if len(items) == 1
+                 else f"kas_semua_kantong_{stamp}.xlsx")
+    await reply_target.reply_document(
+        document=io.BytesIO(xlsx), filename=nama_xlsx,
+        caption=f"\U0001f4ca Laporan Kas {date_from.strftime('%B %Y')} — "
+                + (f"Kantong {items[0][0]}" if len(items) == 1 else f"{len(items)} kantong"),
+    )
+    for nama, rows, saldo in items:
+        pdf = kas_report.generate_pdf(nama, rows, saldo, periode)
+        await reply_target.reply_document(
+            document=io.BytesIO(pdf), filename=f"kas_{nama.replace(' ', '_')}_{stamp}.pdf",
+            caption=f"\U0001f4c4 Kantong {nama} — {date_from.strftime('%B %Y')}",
+        )
+
+
 async def _generate_single_statement(reply_target, user_id, user_name,
                                       date_from, date_to, month, year):
     try:
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(Transaction)
-                .where(
-                    Transaction.is_deleted == False,
-                    Transaction.user_id == user_id,
-                    Transaction.transaction_date >= date_from,
-                    Transaction.transaction_date <= date_to,
-                )
-                .order_by(Transaction.transaction_date)
-            )
-            txs = result.scalars().all()
-            pre_summary = await get_summary(session, user_id=user_id,
-                                            date_to=date_from - timedelta(days=1))
-            saldo_awal = pre_summary["saldo"]
+        item = await _ambil_kantong(user_id, user_name, date_from, date_to)
     except Exception as e:
         logger.error(f"[STMT] Query gagal untuk {user_name}: {e}")
         await reply_target.reply_text(f"❌ Gagal mengambil data untuk {user_name}: {e}")
         return
-
-    if not txs:
+    if item is None:
         await reply_target.reply_text(
-            f"\U0001f4ed *{user_name}*: Tidak ada transaksi di "
-            f"{date_from.strftime('%B %Y')}.",
+            f"\U0001f4ed *{user_name}*: Tidak ada transaksi di {date_from.strftime('%B %Y')}.",
             parse_mode="Markdown",
         )
         return
-
     try:
-        pdf_bytes = generate_statement_pdf(txs, date_from, date_to, saldo_awal, user_name=user_name)
-        filename = f"statement_{user_name.replace(' ', '_')}_{year}_{month:02d}.pdf"
-        await reply_target.reply_document(
-            document=io.BytesIO(pdf_bytes),
-            filename=filename,
-            caption=f"\U0001f4c4 E-Statement {date_from.strftime('%B %Y')} — {user_name}",
-        )
+        await _kirim_laporan(reply_target, [item], date_from, date_to, month, year)
     except Exception as e:
-        logger.error(f"PDF generation failed for {user_name}: {e}")
-        await reply_target.reply_text(f"❌ Gagal generate PDF untuk {user_name}: {e}")
+        logger.error(f"Laporan kas gagal untuk {user_name}: {e}")
+        await reply_target.reply_text(f"❌ Gagal membuat laporan untuk {user_name}: {e}")
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):

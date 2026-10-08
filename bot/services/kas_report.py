@@ -88,6 +88,15 @@ def pihak(uraian: str, tx_type: str, owner_label: str) -> tuple[str, str]:
     return SUMBER_DIKENAL.get(teks.lower(), "-"), owner_label
 
 
+def kategori_transfer(subjek: str, objek: str, owner_label: str) -> str:
+    """"Transaksi Internal" kalau lawan transaksinya Kasir atau kantong lain (bukan toko/pihak luar),
+    supaya reconbot memperlakukannya sebagai kandidat pencocokan transfer antar sheet."""
+    lawan = objek if subjek == owner_label else subjek
+    if lawan == owner_label or not lawan or lawan == "-":
+        return ""
+    return "Transaksi Internal" if lawan.lower() == "kasir" or lawan.lower().startswith("kantong ") else ""
+
+
 def dari_transaksi(tx, owner_label: str) -> KasRow:
     """Transaction stoabot -> KasRow. keluar = Debit negatif, masuk = Kredit positif."""
     amt = Decimal(str(tx.amount))
@@ -96,7 +105,8 @@ def dari_transaksi(tx, owner_label: str) -> KasRow:
     return KasRow(
         tanggal=tx.transaction_date, uraian=tx.description,
         debit=-amt if keluar else None, kredit=None if keluar else amt,
-        kategori=map_kategori(tx.category), subjek=subjek, objek=objek,
+        kategori=map_kategori(tx.category) or kategori_transfer(subjek, objek, owner_label),
+        subjek=subjek, objek=objek,
         ket="Struk terlampir" if getattr(tx, "attachments", None) else "",
     )
 
@@ -122,7 +132,10 @@ def ringkas(rows: list[KasRow], saldo_awal: Decimal) -> tuple[Decimal, Decimal, 
 
 
 def _nama_sheet(owner: str) -> str:
-    s = re.sub(r"[\[\]:*?/\\]", " ", label_kantong(owner))
+    """Nama sheet = nama pemilik SAJA, tanpa awalan "Kantong". reconbot mencocokkan Subjek/Objek ke
+    nama sheet lewat token terpanjang (resolve_account_sheet); awalan "Kantong" yang dipakai semua
+    sheet membuat semua kantong terpetakan ke sheet pertama."""
+    s = re.sub(r"[\[\]:*?/\\]", " ", (owner or "").strip() or "Kantong")
     return re.sub(r"\s+", " ", s).strip()[:31]
 
 

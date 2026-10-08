@@ -5,6 +5,7 @@ from decimal import Decimal
 from openpyxl import load_workbook
 
 from bot.services.kas_report import (
+    kategori_transfer,
     STD_HEADER, KasRow, generate_pdf, generate_xlsx, hitung_saldo, label_kantong,
     map_kategori, pihak, ringkas,
 )
@@ -35,7 +36,7 @@ def test_saldo_dan_total_debit_negatif():
 
 def test_layout_excel_persis_reconbot():
     wb = load_workbook(io.BytesIO(generate_xlsx([("Widia Sari", contoh_rows(), D(50_000))])))
-    ws = wb["Kantong Widia Sari"]
+    ws = wb["Widia Sari"]
     assert [c.value for c in ws[1]] == STD_HEADER
     # baris 2 = Saldo Awal Bulan (positif -> kolom Kredit), F = saldo awal
     assert (ws["B2"].value, ws["C2"].value, ws["E2"].value, ws["F2"].value) == ("Saldo Awal", "Saldo Awal Bulan", 50000, 50000)
@@ -56,14 +57,14 @@ def test_layout_excel_persis_reconbot():
 
 def test_saldo_awal_negatif_masuk_kolom_debit():
     wb = load_workbook(io.BytesIO(generate_xlsx([("Kiki", [], D(-500))])))
-    ws = wb["Kantong Kiki"]
+    ws = wb["Kiki"]
     assert ws["D2"].value == -500 and ws["E2"].value is None and ws["F2"].value == -500
 
 
 def test_banyak_kantong_satu_workbook_dan_nama_sheet_aman():
     wb = load_workbook(io.BytesIO(generate_xlsx([
         ("Widia", contoh_rows(), D(0)), ("Mita/Wandia:*", [], D(0)), ("Widia", [], D(0))])))
-    assert wb.sheetnames == ["Kantong Widia", "Kantong Mita Wandia", "Kantong Widia 2"]
+    assert wb.sheetnames == ["Widia", "Mita Wandia", "Widia 2"]
 
 
 def test_pdf_valid():
@@ -84,3 +85,12 @@ def test_pihak_subjek_objek():
     assert pihak("dari kantong mita", "masuk", own) == ("Kantong Mita", own)
     assert pihak("Uang masuk", "masuk", own) == ("-", own)
     assert pihak("Kasir", "masuk", own) == ("Kasir", own)
+
+
+def test_transfer_ke_kasir_atau_kantong_lain_jadi_transaksi_internal():
+    own = label_kantong("Widia Sari")
+    assert kategori_transfer("Kasir", own, own) == "Transaksi Internal"          # uang masuk dari Kasir
+    assert kategori_transfer("Kantong Mita", own, own) == "Transaksi Internal"   # dari kantong lain
+    assert kategori_transfer(own, "Kantong Mita", own) == "Transaksi Internal"   # pindah ke kantong lain
+    assert kategori_transfer(own, "Pasar", own) == ""                            # belanja biasa
+    assert kategori_transfer("-", own, own) == ""

@@ -147,3 +147,24 @@ def test_tanpa_bank_sumber_hanya_bank_biru_dan_kasir(monkeypatch):
     own = label_kantong("Mita")
     assert pihak("Jago", "masuk", own) == ("-", own)
     assert pihak("Bank Biru", "masuk", own) == ("Bank Biru", own)
+
+
+def test_pemilik_yang_bentrok_dengan_sheet_bank_pakai_nama_satu_token(monkeypatch):
+    from bot.config import settings
+    monkeypatch.setattr(settings, "bank_sumber", "BCA - Royyan")
+    assert label_kantong("Royyan Paice") == "Royyan-Kantong"
+    assert label_kantong("Mita Wandia") == "Kantong Mita Wandia"          # tidak bentrok: tidak berubah
+    wb = load_workbook(io.BytesIO(generate_xlsx([("Royyan Paice", [], D(0)), ("Mita Wandia", [], D(0))])))
+    assert wb.sheetnames == ["Royyan-Kantong", "Mita Wandia"]
+    own = label_kantong("Mita Wandia")
+    assert pihak("dari kantong royyan", "masuk", own) == ("Royyan-Kantong", own)
+    assert pihak("Pindah Ke Kantong Royyan", "keluar", own) == (own, "Royyan-Kantong")
+    assert pihak("BCA - Royyan", "masuk", label_kantong("Royyan Paice")) == ("BCA - Royyan", "Royyan-Kantong")
+    assert kategori_transfer("Royyan-Kantong", own, own) == "Transaksi Internal"
+    assert kategori_transfer("BCA - Royyan", "Royyan-Kantong", "Royyan-Kantong") == "Transaksi Internal"
+
+
+def test_tanpa_bank_sumber_nama_tidak_berubah(monkeypatch):
+    from bot.config import settings
+    monkeypatch.setattr(settings, "bank_sumber", "")
+    assert label_kantong("Royyan Paice") == "Kantong Royyan Paice"

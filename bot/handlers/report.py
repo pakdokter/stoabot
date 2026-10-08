@@ -455,10 +455,11 @@ async def _ambil_kantong(user_id, user_name, date_from, date_to):
         )
         txs = result.scalars().all()
         pre = await get_summary(session, user_id=user_id, date_to=date_from - timedelta(days=1))
+        kamus = await kas_report.muat_kamus_kategori(session)
     if not txs:
         return None
     label = kas_report.label_kantong(user_name)
-    return user_name, [kas_report.dari_transaksi(t, label) for t in txs], pre["saldo"]
+    return user_name, [kas_report.dari_transaksi(t, label, kamus) for t in txs], pre["saldo"]
 
 
 async def _kirim_laporan(reply_target, items, date_from, date_to, month, year):

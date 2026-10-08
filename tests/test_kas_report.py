@@ -5,6 +5,7 @@ from decimal import Decimal
 from openpyxl import load_workbook
 
 from bot.services.kas_report import (
+    KamusKategori, normalisasi_item,
     kategori_transfer,
     STD_HEADER, KasRow, generate_pdf, generate_xlsx, hitung_saldo, label_kantong,
     map_kategori, pihak, ringkas,
@@ -94,3 +95,34 @@ def test_transfer_ke_kasir_atau_kantong_lain_jadi_transaksi_internal():
     assert kategori_transfer(own, "Kantong Mita", own) == "Transaksi Internal"   # pindah ke kantong lain
     assert kategori_transfer(own, "Pasar", own) == ""                            # belanja biasa
     assert kategori_transfer("-", own, own) == ""
+
+
+def test_normalisasi_item_buang_jumlah_dan_ukuran():
+    assert normalisasi_item("Primer Raya — MAIZENA TIMBANGAN 500GR x6") == "maizena timbangan"
+    assert normalisasi_item("Dinda Frozen Food — Sosis x2.0") == "sosis"
+    assert normalisasi_item("Mak opik — Bamer ¼") == "bamer"
+    assert normalisasi_item("Primer Raya (6 item)") == "primer raya"
+
+
+def test_kamus_kategori_hanya_dari_alias_yang_diberikan():
+    kk = KamusKategori({"Sosis": "Belanja Bahan", "Thinwall": "Kemasan", "Daging Slice Grade B": "Belanja Bahan"})
+    assert kk.cari("Dinda Frozen Food — Sosis x2.0") == "Belanja Bahan"
+    assert kk.cari("Primer Raya — Thinwall") == "Kemasan"
+    assert kk.cari("Fadhilah — DAGING SLICE GRADE B x2") == "Belanja Bahan"
+    assert kk.cari("Primer Raya — Sosis Yomas 1Bks") == "Belanja Bahan"   # frasa utuh di dalam nama item
+    assert kk.cari("Fadhilah — Parkir") == ""                               # bukan bahan -> kosong
+    assert kk.cari("") == ""
+
+
+def test_dari_transaksi_pakai_kamus_hanya_untuk_uang_keluar():
+    import types
+    kk = KamusKategori({"Sosis": "Belanja Bahan"})
+    def tx(typ, desc, cat=None):
+        return types.SimpleNamespace(transaction_date=date(2026, 7, 3), type=typ, amount=10_000,
+                                     description=desc, category=cat, attachments=[])
+    from bot.services.kas_report import dari_transaksi
+    own = label_kantong("Widia")
+    assert dari_transaksi(tx("keluar", "Toko — Sosis"), own, kk).kategori == "Belanja Bahan"
+    assert dari_transaksi(tx("keluar", "Toko — Sosis", "Umum"), own, kk).kategori == "Belanja Bahan"
+    assert dari_transaksi(tx("masuk", "Sosis"), own, kk).kategori == ""
+    assert dari_transaksi(tx("keluar", "Toko — Parkir"), own, kk).kategori == ""

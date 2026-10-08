@@ -59,3 +59,10 @@ CREATE TABLE IF NOT EXISTS recon.kamus_bahan (
     nama_baku TEXT NOT NULL,
     kategori  TEXT NOT NULL               -- 'Belanja Bahan' | 'Kemasan'
 );
+
+-- kamus overhead bot-recon (alias -> nama baku + kategori resmi), dari kamus/overhead.json
+CREATE TABLE IF NOT EXISTS recon.kamus_overhead (
+    alias     TEXT PRIMARY KEY,           -- huruf kecil
+    nama_baku TEXT NOT NULL,
+    kategori  TEXT NOT NULL               -- salah satu kategori resmi reconbot
+);

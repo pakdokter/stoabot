@@ -1,8 +1,11 @@
+import io
 from datetime import date
 from decimal import Decimal
 
-from bot.services.kas_report import generate_pdf, generate_xlsx, hitung_saldo, label_kantong, ringkas
-from bot.services.rekap_service import parse_note_text, to_kas_rows
+from openpyxl import load_workbook
+
+from bot.services.rekap_buku_kas import COLUMNS, build_rows, generate_pdf, generate_xlsx, totals
+from bot.services.rekap_service import parse_note_text
 
 D = date(2026, 7, 15)
 
@@ -21,20 +24,34 @@ def test_explicit_date_overrides_forward_date():
     assert ents[0].tanggal == date(2026, 7, 10) and ents[0].amount == 350000
 
 
-def test_rekap_ke_format_reconbot():
+def test_header_catatan_grup_dibaca_reconbot():
+    # reconbot (catatan_grup.py) mewajibkan header ini; JANGAN diubah
+    assert COLUMNS == ["No", "Tanggal", "No. Bukti", "Uraian", "Kategori", "Sumber",
+                       "Debit (Masuk)", "Kredit (Keluar)", "Saldo"]
+
+
+def test_debit_adalah_uang_masuk_kredit_adalah_uang_keluar():
     ents, _ = parse_note_text("+ setoran 1jt\nbeli gula 200rb", D, "Budi")
-    rows = to_kas_rows(ents, label_kantong("Widia"))
-    # Debit negatif (keluar), Kredit positif (masuk)
-    assert rows[0].kredit == Decimal(1_000_000) and rows[0].debit is None
-    assert rows[1].debit == Decimal(-200_000) and rows[1].kredit is None
-    assert rows[0].ket == "No. Bukti KM-260715-01; Sumber: Budi"
-    assert rows[1].ket.startswith("No. Bukti KK-260715-01")
-    assert hitung_saldo(rows, Decimal(500_000)) == [Decimal(1_500_000), Decimal(1_300_000)]
-    assert ringkas(rows, Decimal(500_000)) == (Decimal(-200_000), Decimal(1_000_000), Decimal(1_300_000))
+    rows = build_rows(ents, Decimal(500_000))
+    assert [r[8] for r in rows] == [500_000, 1_500_000, 1_300_000]
+    assert rows[1][6] == 1_000_000 and rows[1][7] is None      # masuk -> kolom Debit (Masuk)
+    assert rows[2][7] == 200_000 and rows[2][6] is None        # keluar -> kolom Kredit (Keluar)
+    assert rows[1][2] == "KM-260715-01" and rows[2][2] == "KK-260715-01"
+    assert rows[1][5] == "Budi"
+    assert totals(rows) == (1_000_000, 200_000, 1_300_000)
 
 
-def test_exports_nonempty():
+def test_excel_debit_kredit_dan_saldo_awal_berupa_angka():
+    # reconbot membaca dengan data_only=True: Debit/Kredit dan baris Saldo Awal harus angka biasa
     ents, _ = parse_note_text("+ setoran 1jt\nbeli gula 200rb", D)
-    rows = to_kas_rows(ents, label_kantong("Widia"))
-    assert generate_xlsx([("Widia", rows, Decimal(0))])[:2] == b"PK"
-    assert generate_pdf("Widia", rows, Decimal(0), "15 Jul 2026")[:4] == b"%PDF"
+    ws = load_workbook(io.BytesIO(generate_xlsx(build_rows(ents, Decimal(500_000))))).active
+    hdr = next(r for r in range(1, 12) if ws.cell(row=r, column=3).value == "No. Bukti")
+    assert [ws.cell(row=hdr, column=c).value for c in range(1, 10)] == COLUMNS
+    assert ws.cell(row=hdr + 1, column=4).value == "Saldo Awal" and ws.cell(row=hdr + 1, column=9).value == 500_000
+    assert ws.cell(row=hdr + 2, column=7).value == 1_000_000      # Debit (Masuk)
+    assert ws.cell(row=hdr + 3, column=8).value == 200_000        # Kredit (Keluar)
+
+
+def test_pdf_valid():
+    ents, _ = parse_note_text("+ setoran 1jt\nbeli gula 200rb", D)
+    assert generate_pdf(build_rows(ents))[:4] == b"%PDF"

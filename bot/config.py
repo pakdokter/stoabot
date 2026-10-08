@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     # Postgres induk bersama: schema/search_path, mis. "stoa,shared". Kosong = schema public (lama)
     db_search_path: str = ""
 
+    # Rekening bank yang boleh jadi sumber dana kantong (pisahkan koma). Isi PERSIS sama dengan nama
+    # sheet rekening di reconbot, mis. "BRI-567(Biz),Jago". Kosong = tombol bank tidak ditampilkan.
+    bank_sumber: str = ""
+
     redis_url: str = "redis://localhost:6379/0"
 
     # OCR
@@ -31,6 +35,10 @@ class Settings(BaseSettings):
     debug: bool = False
     log_level: str = "INFO"
     timezone: str = "Asia/Makassar"
+
+    @property
+    def bank_labels(self) -> list[str]:
+        return [x.strip() for x in self.bank_sumber.split(",") if x.strip()]
 
     @property
     def admin_ids(self) -> list[int]:

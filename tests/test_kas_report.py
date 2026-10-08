@@ -126,3 +126,24 @@ def test_dari_transaksi_pakai_kamus_hanya_untuk_uang_keluar():
     assert dari_transaksi(tx("keluar", "Toko — Sosis", "Umum"), own, kk).kategori == "Belanja Bahan"
     assert dari_transaksi(tx("masuk", "Sosis"), own, kk).kategori == ""
     assert dari_transaksi(tx("keluar", "Toko — Parkir"), own, kk).kategori == ""
+
+
+def test_bank_biru_dan_rekening_bank_dikenali_sebagai_sumber(monkeypatch):
+    from bot.config import settings
+    monkeypatch.setattr(settings, "bank_sumber", "BRI-567(Biz),Jago")
+    own = label_kantong("Royyan Paice")
+    assert pihak("Bank Biru", "masuk", own) == ("Bank Biru", own)
+    assert pihak("BRI-567(Biz)", "masuk", own) == ("BRI-567(Biz)", own)
+    assert pihak("Jago", "masuk", own) == ("Jago", own)
+    assert pihak("Transfer Owner", "masuk", own) == ("-", own)          # teks bebas tetap tidak ditebak
+    for sumber in ("Bank Biru", "Kasir", "BRI-567(Biz)", "Jago", "Kantong Mita"):
+        assert kategori_transfer(sumber, own, own) == "Transaksi Internal"
+    assert kategori_transfer("Transfer Owner", own, own) == ""
+
+
+def test_tanpa_bank_sumber_hanya_bank_biru_dan_kasir(monkeypatch):
+    from bot.config import settings
+    monkeypatch.setattr(settings, "bank_sumber", "")
+    own = label_kantong("Mita")
+    assert pihak("Jago", "masuk", own) == ("-", own)
+    assert pihak("Bank Biru", "masuk", own) == ("Bank Biru", own)

@@ -23,6 +23,7 @@ from bot.services.balance import get_running_balance, get_summary
 from bot.services.sheets import append_transaction as sheets_append
 from bot.services.audit import log_create, log_update, log_delete
 from bot.utils.formatters import fmt_rupiah, fmt_date, parse_amount, parse_date
+from bot.config import settings
 from bot.handlers.auth import ensure_registered
 
 # ── ConversationHandler states ──
@@ -105,12 +106,14 @@ async def handle_nominal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Jika masuk → tampilkan pilihan sumber
     if context.user_data.get("tx_type") == "masuk":
-        keyboard = InlineKeyboardMarkup([[
+        rows = [[
             InlineKeyboardButton("🏦 Bank Biru", callback_data="sumber:Bank Biru"),
             InlineKeyboardButton("🏪 Kasir", callback_data="sumber:Kasir"),
-        ],[
-            InlineKeyboardButton("✏️ Lainnya", callback_data="sumber:Lainnya"),
-        ]])
+        ]]
+        banks = [InlineKeyboardButton(f"🏛 {b}", callback_data=f"sumber:{b}") for b in settings.bank_labels]
+        rows += [banks[i:i + 2] for i in range(0, len(banks), 2)]
+        rows.append([InlineKeyboardButton("✏️ Lainnya", callback_data="sumber:Lainnya")])
+        keyboard = InlineKeyboardMarkup(rows)
         await update.message.reply_text(
             f"💰 *{fmt_rupiah(amount)}*\n\nSumber dana?",
             parse_mode="Markdown",

@@ -32,6 +32,10 @@ CREATE INDEX IF NOT EXISTS idx_alias_bahan ON shared.bahan_alias (bahan_kode);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_alias_match
     ON shared.bahan_alias (lower(match), COALESCE(lower(toko), ''));
 
+-- Kolom tambahan dari Menuplan (toko/supplier langganan & merek)
+ALTER TABLE shared.bahan ADD COLUMN IF NOT EXISTS toko_default TEXT;
+ALTER TABLE shared.bahan ADD COLUMN IF NOT EXISTS merk TEXT;
+
 -- Riwayat harga belanja = VIEW atas stoa.item_prices (diisi stoabot), bahan_kode
 -- di-resolve lewat alias saat dibaca. Tidak ada salinan data yang bisa basi.
 -- (dibuat di 002_views.sql setelah schema stoa terisi)
@@ -42,15 +46,7 @@ CREATE TABLE IF NOT EXISTS shared.shared_rules (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- ── menuplan: harga manual yang merujuk harga belanja ───────────────
-CREATE TABLE IF NOT EXISTS menuplan.harga_manual (
-    bahan_kode TEXT PRIMARY KEY REFERENCES shared.bahan(kode) ON UPDATE CASCADE ON DELETE CASCADE,
-    harga      NUMERIC(15,2) NOT NULL CHECK (harga >= 0),  -- per satuan bahan (g/ml/pcs)
-    catatan    TEXT,
-    diubah_oleh TEXT,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
+-- (Harga manual Menuplan tetap lewat tabel bahan_override milik Menuplan; tidak ada tabel harga manual di sini.)
 
 -- ── recon: kamus bahan bot-recon (pemetaan alias -> nama baku Kas-Buku) ──
 -- Menyimpan pemetaan asli recon utuh, termasuk yang kalah konflik di shared.bahan_alias.
